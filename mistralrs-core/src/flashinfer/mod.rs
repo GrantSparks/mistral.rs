@@ -132,8 +132,17 @@ impl AttentionBackend for FlashInferAttentionBackend {
     }
 }
 
-fn supports_flashinfer_group_size(q_heads: usize, kv_heads: usize) -> bool {
-    kv_heads != 0 && q_heads.is_multiple_of(kv_heads) && q_heads / kv_heads <= 8
+/// Invariant: the accepted set below must stay exactly equal to the group sizes
+/// instantiated by `DISPATCH_GQA_GROUP_SIZE` in
+/// `mistralrs-paged-attn/src/cuda/flashinfer/utils.cuh`. That macro is the only
+/// place the decode kernels are specialized, and it raises a runtime error for
+/// any group size it does not name. Accepting a group size the macro omits lays
+/// out the KV cache for FlashInfer and then fails every decode; rejecting one it
+/// does name silently gives up the FlashInfer decode path.
+pub(crate) fn supports_flashinfer_group_size(q_heads: usize, kv_heads: usize) -> bool {
+    kv_heads != 0
+        && q_heads.is_multiple_of(kv_heads)
+        && matches!(q_heads / kv_heads, 1 | 2 | 3 | 4 | 6 | 8 | 16)
 }
 
 impl FlashInferPagedAttentionViews {

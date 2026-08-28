@@ -1303,7 +1303,7 @@ fn gemma4_attention_backend_for_layer(
     let q_heads = config.num_attn_heads();
     let kv_heads = config.num_kv_heads_for_layer(layer_idx);
     let head_dim = config.k_head_dim_for_layer(layer_idx);
-    if kv_heads == 0 || !q_heads.is_multiple_of(kv_heads) {
+    if !crate::flashinfer::supports_flashinfer_group_size(q_heads, kv_heads) {
         return AttentionBackendKind::Standard;
     }
     if config.v_head_dim_for_layer(layer_idx) == head_dim
