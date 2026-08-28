@@ -369,7 +369,11 @@ impl Attention {
             }
         };
 
-        attn_output = if !matches!(attention_mask, AttentionMask::None) {
+        // Prefill and SDPA paths return head-major rank-4 `[b, h, s, d]`; the paged-decode
+        // kernels return token-major rank-3 `[n, h, d]`. The attention-mask state is not a
+        // reliable proxy for which one ran: paged prefill chunks and prefix-cache-hit prefills
+        // carry `AttentionMask::None` yet still produce rank-4 output. Discriminate on rank.
+        attn_output = if attn_output.rank() == 4 {
             attn_output.transpose(1, 2)?.reshape((b_sz, q_len, ()))?
         } else {
             attn_output.reshape((b_sz, q_len, ()))?
