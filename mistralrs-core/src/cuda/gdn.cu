@@ -644,19 +644,29 @@ extern "C" void causal_conv1d_update(const void *x, const void *weight,
 // ============================================================================
 // Kernel 2b: causal_conv1d_full (prefill path)
 //
-// Each thread handles one (channel, position): causal window with
-// zero-padding, dot product with weight, SiLU.
-// A second pass writes the conv_state from the last kernel_size positions.
+// Each thread handles one (channel, position): causal window over the
+// concatenation of the carried conv state and this chunk, dot product with
+// weight, SiLU. A second pass writes the new conv_state from the last
+// kernel_size entries of that same concatenation.
+//
+// Positions before the start of the chunk read the carried conv state, which
+// uses the same layout causal_conv1d_update maintains: conv_state[k] holds the
+// input kernel_size-1-k steps before the chunk, so the value at chunk-relative
+// position src_pos < 0 is conv_state[kernel_size + src_pos]. A null
+// conv_state_in means no prior context and falls back to zero-padding, which
+// is what a genuinely fresh sequence needs.
 //
 // x: [B, conv_dim, S]  weight: [conv_dim, kernel_size]
+// conv_state_in: [B, conv_dim, kernel_size] or null
 // conv_state_out: [B, conv_dim, kernel_size]  output: [B, conv_dim, S]
 // ============================================================================
 
 template <typename T>
 __global__ void causal_conv1d_full_kernel(
-    const T *__restrict__ x,      // [B, conv_dim, S]
-    const T *__restrict__ weight, // [conv_dim, kernel_size]
-    T *__restrict__ output,       // [B, conv_dim, S]
+    const T *__restrict__ x,             // [B, conv_dim, S]
+    const T *__restrict__ weight,        // [conv_dim, kernel_size]
+    const T *__restrict__ conv_state_in, // [B, conv_dim, kernel_size] or null
+    T *__restrict__ output,              // [B, conv_dim, S]
     int batch_size, int conv_dim, int seq_len, int kernel_size) {
 
   const int ch = blockIdx.x * blockDim.x + threadIdx.x;
@@ -668,12 +678,23 @@ __global__ void causal_conv1d_full_kernel(
 
   const T *x_bch = x + (b * conv_dim + ch) * seq_len;
   const T *w = weight + ch * kernel_size;
+  const T *cs_in =
+      conv_state_in ? conv_state_in + (b * conv_dim + ch) * kernel_size
+                    : nullptr;
 
   // Causal convolution: sum over kernel_size window ending at pos
   float acc = 0.0f;
   for (int i = 0; i < kernel_size; i++) {
     int src_pos = pos - (kernel_size - 1) + i;
-    float x_val = (src_pos >= 0) ? (float)x_bch[src_pos] : 0.0f;
+    float x_val;
+    if (src_pos >= 0) {
+      x_val = (float)x_bch[src_pos];
+    } else if (cs_in != nullptr) {
+      // src_pos is in [-(kernel_size-1), -1], so this index is in [1, K-1].
+      x_val = (float)cs_in[kernel_size + src_pos];
+    } else {
+      x_val = 0.0f;
+    }
     acc += x_val * (float)w[i];
   }
 
@@ -686,8 +707,9 @@ __global__ void causal_conv1d_full_kernel(
 
 template <typename T>
 __global__ void save_conv_state_kernel(
-    const T *__restrict__ x,        // [B, conv_dim, S]
-    T *__restrict__ conv_state_out, // [B, conv_dim, kernel_size]
+    const T *__restrict__ x,             // [B, conv_dim, S]
+    const T *__restrict__ conv_state_in, // [B, conv_dim, kernel_size] or null
+    T *__restrict__ conv_state_out,      // [B, conv_dim, kernel_size]
     int batch_size, int conv_dim, int seq_len, int kernel_size) {
 
   const int ch = blockIdx.x * blockDim.x + threadIdx.x;
@@ -697,20 +719,29 @@ __global__ void save_conv_state_kernel(
     return;
 
   const T *x_bch = x + (b * conv_dim + ch) * seq_len;
+  const T *cs_in =
+      conv_state_in ? conv_state_in + (b * conv_dim + ch) * kernel_size
+                    : nullptr;
   T *cs = conv_state_out + (b * conv_dim + ch) * kernel_size;
 
-  // Save last kernel_size positions (zero-pad if seq_len < kernel_size)
-  int pad = kernel_size - seq_len;
+  // Save the last kernel_size entries of [conv_state_in ++ x]. When the chunk
+  // is shorter than the kernel the head of the window is still prior context,
+  // which is carried over rather than zeroed (a null conv_state_in has no
+  // prior context, so it zero-pads).
   for (int i = 0; i < kernel_size; i++) {
-    if (i < pad) {
-      cs[i] = (T)0.0f;
+    int src_pos = seq_len - kernel_size + i;
+    if (src_pos >= 0) {
+      cs[i] = x_bch[src_pos];
+    } else if (cs_in != nullptr) {
+      cs[i] = cs_in[kernel_size + src_pos];
     } else {
-      cs[i] = x_bch[seq_len - kernel_size + i];
+      cs[i] = (T)0.0f;
     }
   }
 }
 
 extern "C" void causal_conv1d_full(const void *x, const void *weight,
+                                   const void *conv_state_in,
                                    void *conv_state_out, void *output,
                                    int batch_size, int conv_dim, int seq_len,
                                    int kernel_size, int dtype, int64_t stream) {
@@ -722,21 +753,24 @@ extern "C" void causal_conv1d_full(const void *x, const void *weight,
 
   if (dtype == 0) {
     causal_conv1d_full_kernel<__half><<<grid, block, 0, custream>>>(
-        (const __half *)x, (const __half *)weight, (__half *)output, batch_size,
-        conv_dim, seq_len, kernel_size);
+        (const __half *)x, (const __half *)weight,
+        (const __half *)conv_state_in, (__half *)output, batch_size, conv_dim,
+        seq_len, kernel_size);
     // Save conv state
     dim3 grid2((conv_dim + 255) / 256, batch_size);
     save_conv_state_kernel<__half><<<grid2, block, 0, custream>>>(
-        (const __half *)x, (__half *)conv_state_out, batch_size, conv_dim,
-        seq_len, kernel_size);
+        (const __half *)x, (const __half *)conv_state_in,
+        (__half *)conv_state_out, batch_size, conv_dim, seq_len, kernel_size);
   } else {
     causal_conv1d_full_kernel<__nv_bfloat16><<<grid, block, 0, custream>>>(
         (const __nv_bfloat16 *)x, (const __nv_bfloat16 *)weight,
-        (__nv_bfloat16 *)output, batch_size, conv_dim, seq_len, kernel_size);
+        (const __nv_bfloat16 *)conv_state_in, (__nv_bfloat16 *)output,
+        batch_size, conv_dim, seq_len, kernel_size);
     dim3 grid2((conv_dim + 255) / 256, batch_size);
     save_conv_state_kernel<__nv_bfloat16><<<grid2, block, 0, custream>>>(
-        (const __nv_bfloat16 *)x, (__nv_bfloat16 *)conv_state_out, batch_size,
-        conv_dim, seq_len, kernel_size);
+        (const __nv_bfloat16 *)x, (const __nv_bfloat16 *)conv_state_in,
+        (__nv_bfloat16 *)conv_state_out, batch_size, conv_dim, seq_len,
+        kernel_size);
   }
 }
 

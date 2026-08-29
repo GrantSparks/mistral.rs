@@ -629,9 +629,14 @@ extern "C" {
         dtype: i32,
         stream: i64,
     );
+    /// `conv_state_in` carries the state left by the preceding chunk, in the
+    /// layout `causal_conv1d_update` maintains. It may be null, which means no
+    /// prior context and restores the zero-padded behaviour. It must not alias
+    /// `conv_state_out`.
     pub(crate) fn causal_conv1d_full(
         x: *const c_void,
         weight: *const c_void,
+        conv_state_in: *const c_void,
         conv_state_out: *mut c_void,
         output: *mut c_void,
         batch_size: i32,

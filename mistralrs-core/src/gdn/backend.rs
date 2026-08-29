@@ -686,6 +686,11 @@ fn finish_recurrence(
         .to_dtype(dtype)
 }
 
+/// Both branches consume `cache.conv_state` as the left context and leave the
+/// state for the next chunk in it, so the split is only about which kernel is
+/// faster for the shape, not about whether there is prior context. A prefill
+/// that continues a restored prefix carries a populated state; a fresh sequence
+/// carries zeros.
 pub fn causal_conv1d(
     x: &Tensor,
     conv1d_weight: &Tensor,
@@ -845,10 +850,11 @@ fn causal_conv1d_full(
             .squeeze(1)?
             .to_dtype(x_t.dtype())?
             .contiguous()?;
+        let conv_state = cache.conv_state.contiguous()?;
         let (output, new_conv_state) = crate::cuda::gdn::causal_conv1d_cuda(
             &x_t,
             &weight,
-            &cache.conv_state,
+            &conv_state,
             dims.conv_kernel_size,
             false,
         )?;
@@ -873,25 +879,25 @@ fn causal_conv1d_full(
         return output.transpose(1, 2);
     }
 
-    let pad_width = dims.conv_kernel_size.saturating_sub(seq_len);
-    cache.conv_state = if pad_width > 0 {
-        let zeros = Tensor::zeros((batch_size, conv_dim, pad_width), x_t.dtype(), x_t.device())?;
-        Tensor::cat(&[zeros, x_t.clone()], 2)?
-    } else {
-        x_t.narrow(2, seq_len - dims.conv_kernel_size, dims.conv_kernel_size)?
-    };
+    // Left context for the first kernel_size-1 outputs is the tail of the
+    // carried conv state: exactly the window the decode path forms as
+    // [conv_state ++ x_t]. A fresh sequence carries zeros, which reproduces the
+    // zero-padding this used to do unconditionally.
+    let prior = cache
+        .conv_state
+        .to_dtype(x_t.dtype())?
+        .narrow(2, 1, dims.conv_kernel_size - 1)?
+        .contiguous()?;
 
-    let padded_t = Tensor::cat(
-        &[
-            Tensor::zeros(
-                (batch_size, conv_dim, dims.conv_kernel_size - 1),
-                x_t.dtype(),
-                x_t.device(),
-            )?,
-            x_t,
-        ],
-        2,
-    )?;
+    let padded_t = Tensor::cat(&[prior, x_t], 2)?;
+
+    // New state: the last kernel_size entries of [conv_state ++ x]. padded_t
+    // already holds the tail of that concatenation and is at least
+    // kernel_size long, so the window is a narrow of it.
+    let padded_len = padded_t.dim(2)?;
+    cache.conv_state = padded_t
+        .narrow(2, padded_len - dims.conv_kernel_size, dims.conv_kernel_size)?
+        .contiguous()?;
 
     let weight = conv1d_weight.squeeze(1)?.to_dtype(padded_t.dtype())?;
 
@@ -1189,5 +1195,262 @@ mod tests {
     fn decode_recurrence_cpu_matches_tensor_path() -> CandleResult<()> {
         run_decode_case(dims(2, 4, 5, 3), 2)?;
         run_decode_case(dims(3, 3, 4, 2), 1)
+    }
+
+    /// The pre-fix full path: zero-pad the left context and zero-pad the saved
+    /// state, both regardless of what the cache carried. Kept verbatim so the
+    /// fresh-sequence case can be pinned to the old numbers.
+    fn causal_conv1d_full_zero_padded_reference(
+        x: &Tensor,
+        conv1d_weight: &Tensor,
+        dims: &GdnDims,
+        cache: &mut GdnLayerCache,
+    ) -> CandleResult<Tensor> {
+        let (batch_size, seq_len, conv_dim) = x.dims3()?;
+        let x_t = x.transpose(1, 2)?.contiguous()?;
+
+        let pad_width = dims.conv_kernel_size.saturating_sub(seq_len);
+        cache.conv_state = if pad_width > 0 {
+            let zeros =
+                Tensor::zeros((batch_size, conv_dim, pad_width), x_t.dtype(), x_t.device())?;
+            Tensor::cat(&[zeros, x_t.clone()], 2)?
+        } else {
+            x_t.narrow(2, seq_len - dims.conv_kernel_size, dims.conv_kernel_size)?
+        };
+
+        let padded_t = Tensor::cat(
+            &[
+                Tensor::zeros(
+                    (batch_size, conv_dim, dims.conv_kernel_size - 1),
+                    x_t.dtype(),
+                    x_t.device(),
+                )?,
+                x_t,
+            ],
+            2,
+        )?;
+
+        let weight = conv1d_weight.squeeze(1)?.to_dtype(padded_t.dtype())?;
+        causal_conv1d_full_cpu_f32(&padded_t, &weight, batch_size, conv_dim, seq_len, dims)
+    }
+
+    struct ConvFixture {
+        dims: GdnDims,
+        batch_size: usize,
+        tokens: usize,
+        x: Tensor,
+        weight: Tensor,
+        initial_conv_state: Tensor,
+        recurrent_state: Tensor,
+    }
+
+    fn conv_fixture(
+        dims: GdnDims,
+        batch_size: usize,
+        tokens: usize,
+        state_scale: f32,
+    ) -> CandleResult<ConvFixture> {
+        let dev = Device::Cpu;
+        let x = Tensor::from_vec(
+            patterned(batch_size * tokens * dims.conv_dim, 11, 0.08, 0.01),
+            (batch_size, tokens, dims.conv_dim),
+            &dev,
+        )?;
+        let weight = Tensor::from_vec(
+            patterned(dims.conv_dim * dims.conv_kernel_size, 12, 0.05, -0.01),
+            (dims.conv_dim, 1, dims.conv_kernel_size),
+            &dev,
+        )?;
+        let initial_conv_state = Tensor::from_vec(
+            patterned(
+                batch_size * dims.conv_dim * dims.conv_kernel_size,
+                13,
+                state_scale,
+                0.0,
+            ),
+            (batch_size, dims.conv_dim, dims.conv_kernel_size),
+            &dev,
+        )?;
+        let recurrent_state = Tensor::zeros(
+            (
+                batch_size,
+                dims.num_v_heads,
+                dims.head_k_dim,
+                dims.head_v_dim,
+            ),
+            DType::F32,
+            &dev,
+        )?;
+        Ok(ConvFixture {
+            dims,
+            batch_size,
+            tokens,
+            x,
+            weight,
+            initial_conv_state,
+            recurrent_state,
+        })
+    }
+
+    impl ConvFixture {
+        fn cache(&self) -> GdnLayerCache {
+            GdnLayerCache {
+                conv_state: self.initial_conv_state.clone(),
+                recurrent_state: self.recurrent_state.clone(),
+            }
+        }
+
+        fn token(&self, idx: usize) -> CandleResult<Tensor> {
+            self.x.narrow(1, idx, 1)?.contiguous()
+        }
+
+        fn chunk(&self, start: usize) -> CandleResult<Tensor> {
+            self.x.narrow(1, start, self.tokens - start)?.contiguous()
+        }
+
+        /// Run every token through the single-token decode kernel, returning
+        /// the per-token outputs and the cache the run leaves behind.
+        fn stepwise(&self, upto: usize) -> CandleResult<(Vec<Tensor>, GdnLayerCache)> {
+            let mut cache = self.cache();
+            let mut outputs = Vec::with_capacity(upto);
+            for idx in 0..upto {
+                outputs.push(causal_conv1d(
+                    &self.token(idx)?,
+                    &self.weight,
+                    &self.dims,
+                    &mut cache,
+                    RecurrentBatchKind::Decode,
+                )?);
+            }
+            Ok((outputs, cache))
+        }
+    }
+
+    /// Continuation equals stepwise: whatever a run of single-token decodes
+    /// leaves in the conv state, resuming the rest of the sequence through the
+    /// multi-token path must produce the same outputs and the same final state
+    /// as decoding every token one at a time.
+    ///
+    /// State equality is exact: the conv state carries raw input values, with
+    /// no arithmetic to reorder. Outputs use the module's tolerance because the
+    /// two paths reach SiLU through different exponentials -- `sigmoid_f32`
+    /// calls libm `exp`, `causal_conv1d_full_cpu_f32` uses `fast_exp`, which is
+    /// documented at ~1e-7 relative error.
+    fn assert_continuation_matches_stepwise(
+        fixture: &ConvFixture,
+        split: usize,
+    ) -> CandleResult<()> {
+        let (reference_outputs, reference_cache) = fixture.stepwise(fixture.tokens)?;
+
+        let (_, mut cache) = fixture.stepwise(split)?;
+        let tail = causal_conv1d(
+            &fixture.chunk(split)?,
+            &fixture.weight,
+            &fixture.dims,
+            &mut cache,
+            RecurrentBatchKind::Prefill,
+        )?;
+
+        assert_eq!(
+            tail.dims3()?,
+            (
+                fixture.batch_size,
+                fixture.tokens - split,
+                fixture.dims.conv_dim
+            ),
+            "split={split}: unexpected continuation shape"
+        );
+
+        for (offset, expected) in reference_outputs[split..].iter().enumerate() {
+            let actual = tail.narrow(1, offset, 1)?.flatten_all()?.to_vec1::<f32>()?;
+            let expected = expected.flatten_all()?.to_vec1::<f32>()?;
+            assert_eq!(actual.len(), expected.len());
+            for (idx, (&lhs, &rhs)) in actual.iter().zip(expected.iter()).enumerate() {
+                let diff = (lhs - rhs).abs();
+                assert!(
+                    diff <= ASSERT_EPS,
+                    "split={split} token={} channel={idx}: continuation={lhs} stepwise={rhs} diff={diff}",
+                    split + offset
+                );
+            }
+        }
+
+        let expected_state = reference_cache.conv_state.flatten_all()?.to_vec1::<f32>()?;
+        let actual_state = cache.conv_state.flatten_all()?.to_vec1::<f32>()?;
+        assert_eq!(
+            actual_state, expected_state,
+            "split={split}: conv state after the continuation differs from stepwise"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn causal_conv1d_full_continuation_matches_stepwise() -> CandleResult<()> {
+        // conv_kernel_size is 4, so split 0 is a resume with no decoded tokens,
+        // splits 1..4 are shorter than the kernel, and 4 and 6 are at and past
+        // it. Tail lengths 3 and 1 also exercise chunks shorter than the kernel.
+        let fixture = conv_fixture(dims(2, 4, 5, 3), 2, 7, 0.03)?;
+        for split in [0, 1, 2, 3, 4, 6] {
+            assert_continuation_matches_stepwise(&fixture, split)?;
+        }
+        let single = conv_fixture(dims(3, 3, 4, 2), 1, 5, 0.05)?;
+        for split in [0, 2, 4] {
+            assert_continuation_matches_stepwise(&single, split)?;
+        }
+        Ok(())
+    }
+
+    /// A genuinely fresh sequence carries an all-zero conv state, and seeding
+    /// from zeros is zero-padding: both the outputs and the saved state must be
+    /// bit-identical to the pre-fix behaviour, not merely close to it.
+    #[test]
+    fn causal_conv1d_full_fresh_sequence_matches_zero_padding() -> CandleResult<()> {
+        for (dims, batch_size, tokens) in [
+            (dims(2, 4, 5, 3), 2, 7),
+            (dims(2, 4, 5, 3), 2, 3),
+            (dims(3, 3, 4, 2), 1, 4),
+        ] {
+            let fixture = conv_fixture(dims, batch_size, tokens, 0.0)?;
+            assert_eq!(
+                fixture
+                    .initial_conv_state
+                    .flatten_all()?
+                    .to_vec1::<f32>()?
+                    .iter()
+                    .filter(|v| **v != 0.0)
+                    .count(),
+                0,
+                "fixture must start from an all-zero conv state"
+            );
+
+            let mut cache = fixture.cache();
+            let actual = causal_conv1d(
+                &fixture.x,
+                &fixture.weight,
+                &fixture.dims,
+                &mut cache,
+                RecurrentBatchKind::Prefill,
+            )?;
+
+            let mut reference_cache = fixture.cache();
+            let expected = causal_conv1d_full_zero_padded_reference(
+                &fixture.x,
+                &fixture.weight,
+                &fixture.dims,
+                &mut reference_cache,
+            )?;
+
+            assert_eq!(
+                actual.flatten_all()?.to_vec1::<f32>()?,
+                expected.flatten_all()?.to_vec1::<f32>()?,
+                "tokens={tokens}: fresh-sequence output changed"
+            );
+            assert_eq!(
+                cache.conv_state.flatten_all()?.to_vec1::<f32>()?,
+                reference_cache.conv_state.flatten_all()?.to_vec1::<f32>()?,
+                "tokens={tokens}: fresh-sequence conv state changed"
+            );
+        }
+        Ok(())
     }
 }

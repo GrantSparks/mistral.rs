@@ -333,6 +333,8 @@ pub fn warp_gated_delta_rule_recurrence_cuda(
 ///
 /// For full (is_update=false):
 ///   x: [B, conv_dim, S]  weight: [conv_dim, kernel_size]
+///   conv_state: [B, conv_dim, kernel_size] carried in from the preceding
+///     chunk and used as the left context (all-zeros for a fresh sequence)
 ///   Returns: (output [B, conv_dim, S], new conv_state [B, conv_dim, kernel_size])
 #[cfg(feature = "cuda")]
 pub fn causal_conv1d_cuda(
@@ -412,14 +414,25 @@ pub fn causal_conv1d_cuda(
 
             Ok((output, conv_state_new))
         } else {
-            // Full path: allocate new conv_state and output
+            // Full path: seed the left context from the incoming conv_state and
+            // write the new state into a fresh buffer. The incoming state is a
+            // distinct allocation from cs_buf, so the kernel's restrict
+            // pointers do not alias.
             let output_buf = unsafe { dev.alloc::<T>(batch_size * conv_dim * seq_len) }?;
             let cs_buf = unsafe { dev.alloc::<T>(batch_size * conv_dim * kernel_size) }?;
+
+            let (cs_in_storage, cs_in_l) = conv_state.storage_and_layout();
+            let cs_in_s = match &*cs_in_storage {
+                candle::Storage::Cuda(c) => c.as_cuda_slice::<T>()?,
+                _ => candle::bail!("conv_state must be a cuda tensor"),
+            };
+            let cs_in_offset = cs_in_l.start_offset();
 
             unsafe {
                 crate::cuda::ffi::causal_conv1d_full(
                     x_s.slice(x_offset..).device_ptr(x_s.stream()).0 as *const c_void,
                     w_s.slice(w_offset..).device_ptr(w_s.stream()).0 as *const c_void,
+                    cs_in_s.slice(cs_in_offset..).device_ptr(cs_in_s.stream()).0 as *const c_void,
                     cs_buf.device_ptr(cs_buf.stream()).0 as *mut c_void,
                     output_buf.device_ptr(output_buf.stream()).0 as *mut c_void,
                     batch_size as i32,
@@ -1145,6 +1158,172 @@ mod tests {
             &warp_state_flat,
             3.0e-4,
         );
+        Ok(())
+    }
+
+    #[derive(Clone, Copy)]
+    struct ConvCase {
+        batch_size: usize,
+        conv_dim: usize,
+        kernel_size: usize,
+        tokens: usize,
+        split: usize,
+        state_scale: f32,
+    }
+
+    /// Continuation equals stepwise: run `split` tokens through the
+    /// single-token update kernel, then feed the state it leaves behind to the
+    /// multi-token kernel for the rest. Outputs and the final state must match
+    /// decoding every token one at a time.
+    ///
+    /// Equality is exact, not approximate. Both kernels accumulate the same
+    /// `kernel_size` products in the same order from the same stored values,
+    /// one thread per (channel, position) with no cross-thread reduction and no
+    /// atomics, so there is no launch-order nondeterminism for a tolerance to
+    /// absorb -- any difference here is a difference in what the paths compute.
+    fn run_conv_case(case: ConvCase, dtype: DType, dev: &Device) -> Result<()> {
+        let ConvCase {
+            batch_size,
+            conv_dim,
+            kernel_size,
+            tokens,
+            split,
+            state_scale,
+        } = case;
+
+        let x = tensor3(
+            patterned(batch_size * conv_dim * tokens, 21, 0.08, 0.01),
+            (batch_size, conv_dim, tokens),
+            dev,
+        )?
+        .to_dtype(dtype)?;
+        let weight = tensor2(
+            patterned(conv_dim * kernel_size, 22, 0.05, -0.01),
+            (conv_dim, kernel_size),
+            dev,
+        )?
+        .to_dtype(dtype)?;
+        let initial_state = tensor3(
+            patterned(batch_size * conv_dim * kernel_size, 23, state_scale, 0.0),
+            (batch_size, conv_dim, kernel_size),
+            dev,
+        )?
+        .to_dtype(dtype)?;
+
+        // The update kernel mutates the state it is handed, so the snapshot has
+        // to be an independent allocation rather than a view.
+        let mut state = initial_state.copy()?;
+        let mut snapshot = None;
+        let mut stepwise = Vec::with_capacity(tokens);
+        for t in 0..tokens {
+            if t == split {
+                snapshot = Some(state.copy()?);
+            }
+            let token = x.narrow(2, t, 1)?.contiguous()?;
+            let (out, next) = causal_conv1d_cuda(&token, &weight, &state, kernel_size, true)?;
+            stepwise.push(out);
+            state = next;
+        }
+        let snapshot = snapshot.expect("split must be < tokens");
+
+        let tail = x.narrow(2, split, tokens - split)?.contiguous()?;
+        let (full_out, full_state) =
+            causal_conv1d_cuda(&tail, &weight, &snapshot, kernel_size, false)?;
+
+        let expected_out = Tensor::cat(&stepwise[split..], 2)?;
+        let name = format!(
+            "{dtype:?} b={batch_size},c={conv_dim},k={kernel_size},n={tokens},split={split},scale={state_scale}"
+        );
+        assert_close(
+            &format!("{name} continuation output"),
+            &flat(&full_out.to_dtype(DType::F32)?)?,
+            &flat(&expected_out.to_dtype(DType::F32)?)?,
+            0.0,
+        );
+        assert_close(
+            &format!("{name} continuation state"),
+            &flat(&full_state.to_dtype(DType::F32)?)?,
+            &flat(&state.to_dtype(DType::F32)?)?,
+            0.0,
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires a CUDA device"]
+    fn conv_continuation_matches_stepwise_cuda() -> Result<()> {
+        let dev = Device::new_cuda(0)?;
+        for dtype in [DType::F16, DType::BF16] {
+            for case in [
+                // split=0 from an all-zero state is the fresh-sequence case:
+                // seeding from zeros is zero-padding, so this is also the proof
+                // that a cold prefill still computes what it used to.
+                ConvCase {
+                    batch_size: 1,
+                    conv_dim: 512,
+                    kernel_size: 4,
+                    tokens: 9,
+                    split: 0,
+                    state_scale: 0.0,
+                },
+                // split=0 carrying real state: the whole chunk is a resume.
+                ConvCase {
+                    batch_size: 2,
+                    conv_dim: 512,
+                    kernel_size: 4,
+                    tokens: 9,
+                    split: 0,
+                    state_scale: 0.03,
+                },
+                // splits shorter than, equal to, and past the kernel.
+                ConvCase {
+                    batch_size: 2,
+                    conv_dim: 512,
+                    kernel_size: 4,
+                    tokens: 9,
+                    split: 2,
+                    state_scale: 0.03,
+                },
+                ConvCase {
+                    batch_size: 2,
+                    conv_dim: 512,
+                    kernel_size: 4,
+                    tokens: 9,
+                    split: 4,
+                    state_scale: 0.03,
+                },
+                ConvCase {
+                    batch_size: 2,
+                    conv_dim: 512,
+                    kernel_size: 4,
+                    tokens: 9,
+                    split: 7,
+                    state_scale: 0.03,
+                },
+                // A tail shorter than the kernel: the saved state is then part
+                // prior context, part new chunk.
+                ConvCase {
+                    batch_size: 1,
+                    conv_dim: 4096,
+                    kernel_size: 4,
+                    tokens: 5,
+                    split: 3,
+                    state_scale: 0.03,
+                },
+                // The production shape: Qwen3-Next carries conv_dim 4096 with a
+                // kernel of 4 across every GDN layer.
+                ConvCase {
+                    batch_size: 1,
+                    conv_dim: 4096,
+                    kernel_size: 4,
+                    tokens: 33,
+                    split: 16,
+                    state_scale: 0.03,
+                },
+            ] {
+                run_conv_case(case, dtype, &dev)?;
+            }
+        }
         Ok(())
     }
 
