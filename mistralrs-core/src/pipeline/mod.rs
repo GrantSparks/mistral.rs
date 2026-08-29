@@ -1028,7 +1028,8 @@ pub trait Pipeline:
         let block_hashes = compute_block_hashes(seq.get_toks(), block_size, seq.mm_features(), &[]);
         let n_blocks = cached_tokens / block_size;
         if block_hashes.len() >= n_blocks {
-            prefix_cacher.add_paged_recurrent_prefix(block_hashes[..n_blocks].to_vec(), snapshots);
+            prefix_cacher
+                .add_paged_recurrent_prefix(block_hashes[..n_blocks].to_vec(), snapshots)?;
         }
         Ok(())
     }

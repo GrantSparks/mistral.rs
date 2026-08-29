@@ -240,6 +240,7 @@ impl Engine {
         mut no_kv_cache: bool,
         mut no_prefix_cache: bool,
         prefix_cache_n: usize,
+        prefix_cache_host_bytes: u64,
         disable_eos_stop: bool,
         throughput_logging_enabled: bool,
         search_embedding_model: Option<SearchEmbeddingModel>,
@@ -299,6 +300,7 @@ impl Engine {
                 prefix_cache_n,
                 no_prefix_cache,
                 has_paged_attention,
+                prefix_cache_host_bytes,
             ))),
             is_debug: DEBUG.load(Ordering::Relaxed),
             disable_eos_stop,
@@ -811,10 +813,15 @@ impl Engine {
                                     if block_hashes.len() < num_blocks {
                                         continue;
                                     }
-                                    prefix_cacher.add_paged_recurrent_prefix(
+                                    if let Err(e) = prefix_cacher.add_paged_recurrent_prefix(
                                         block_hashes[..num_blocks].to_vec(),
                                         snapshots,
-                                    );
+                                    ) {
+                                        tracing::warn!(
+                                            "Failed retaining recurrent state for sequence {}: {e}",
+                                            seq.id()
+                                        );
+                                    }
                                 }
                             }
                         }

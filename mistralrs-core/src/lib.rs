@@ -164,6 +164,7 @@ pub use pipeline::{
     SpeechLoader, SpeechPipeline, Starcoder2Loader, SupportedModality, TokenSource,
     UqffWriteConfig, UQFF_MULTI_FILE_DELIMITER,
 };
+pub use prefix_cacher::DEFAULT_PREFIX_CACHE_HOST_BYTES;
 pub use request::{
     ApproximateUserLocation, CalibrationAction, CalibrationRequest, Constraint,
     DetokenizationRequest, ImageGenerationResponseFormat, LlguidanceGrammar, MessageContent,
@@ -213,6 +214,9 @@ pub struct EngineConfig {
     pub no_kv_cache: bool,
     pub no_prefix_cache: bool,
     pub prefix_cache_n: usize,
+    /// Host memory the recurrent-state prefix snapshot store may hold, in
+    /// bytes. See [`DEFAULT_PREFIX_CACHE_HOST_BYTES`].
+    pub prefix_cache_host_bytes: u64,
     pub disable_eos_stop: bool,
     pub throughput_logging_enabled: bool,
     pub search_embedding_model: Option<SearchEmbeddingModel>,
@@ -226,6 +230,7 @@ impl Default for EngineConfig {
             no_kv_cache: false,
             no_prefix_cache: false,
             prefix_cache_n: 16,
+            prefix_cache_host_bytes: DEFAULT_PREFIX_CACHE_HOST_BYTES,
             disable_eos_stop: false,
             throughput_logging_enabled: true,
             search_embedding_model: None,
@@ -420,6 +425,7 @@ struct RebootState {
     no_kv_cache: bool,
     no_prefix_cache: bool,
     prefix_cache_n: usize,
+    prefix_cache_host_bytes: u64,
     disable_eos_stop: bool,
     throughput_logging_enabled: bool,
     search_embedding_model: Option<SearchEmbeddingModel>,
@@ -494,6 +500,7 @@ pub struct MistralRsBuilder {
     no_kv_cache: Option<bool>,
     no_prefix_cache: Option<bool>,
     prefix_cache_n: Option<usize>,
+    prefix_cache_host_bytes: Option<u64>,
     disable_eos_stop: Option<bool>,
     throughput_logging_enabled: bool,
     search_embedding_model: Option<SearchEmbeddingModel>,
@@ -524,6 +531,7 @@ impl MistralRsBuilder {
             no_kv_cache: None,
             no_prefix_cache: None,
             prefix_cache_n: None,
+            prefix_cache_host_bytes: None,
             disable_eos_stop: None,
             throughput_logging_enabled: throughput_logging,
             search_embedding_model,
@@ -567,6 +575,13 @@ impl MistralRsBuilder {
     }
     pub fn with_prefix_cache_n(mut self, prefix_cache_n: usize) -> Self {
         self.prefix_cache_n = Some(prefix_cache_n);
+        self
+    }
+    /// Bound the host memory the recurrent-state prefix snapshot store may
+    /// hold, in bytes. Defaults to [`DEFAULT_PREFIX_CACHE_HOST_BYTES`]; 0 keeps
+    /// no recurrent snapshots.
+    pub fn with_prefix_cache_host_bytes(mut self, prefix_cache_host_bytes: u64) -> Self {
+        self.prefix_cache_host_bytes = Some(prefix_cache_host_bytes);
         self
     }
     pub fn with_disable_eos_stop(mut self, disable_eos_stop: bool) -> Self {
@@ -771,6 +786,7 @@ impl MistralRs {
                         config.no_kv_cache,
                         config.no_prefix_cache,
                         config.prefix_cache_n,
+                        config.prefix_cache_host_bytes,
                         config.disable_eos_stop,
                         config.throughput_logging_enabled,
                         config.search_embedding_model,
@@ -810,6 +826,7 @@ impl MistralRs {
                         config.no_kv_cache,
                         config.no_prefix_cache,
                         config.prefix_cache_n,
+                        config.prefix_cache_host_bytes,
                         config.disable_eos_stop,
                         config.throughput_logging_enabled,
                         config.search_embedding_model,
@@ -1050,6 +1067,7 @@ impl MistralRs {
             no_kv_cache,
             no_prefix_cache,
             prefix_cache_n,
+            prefix_cache_host_bytes,
             disable_eos_stop,
             throughput_logging_enabled,
             search_embedding_model,
@@ -1076,6 +1094,8 @@ impl MistralRs {
         let no_kv_cache = no_kv_cache.unwrap_or(false);
         let no_prefix_cache = no_prefix_cache.unwrap_or(false);
         let prefix_cache_n = prefix_cache_n.unwrap_or(16);
+        let prefix_cache_host_bytes =
+            prefix_cache_host_bytes.unwrap_or(DEFAULT_PREFIX_CACHE_HOST_BYTES);
         let disable_eos_stop = disable_eos_stop.unwrap_or(false);
 
         Self::init_external_tool_callbacks(
@@ -1093,6 +1113,7 @@ impl MistralRs {
             no_kv_cache,
             no_prefix_cache,
             prefix_cache_n,
+            prefix_cache_host_bytes,
             disable_eos_stop,
             throughput_logging_enabled,
             search_embedding_model,
@@ -1106,6 +1127,7 @@ impl MistralRs {
             no_kv_cache,
             no_prefix_cache,
             prefix_cache_n,
+            prefix_cache_host_bytes,
             disable_eos_stop,
             throughput_logging_enabled,
             search_embedding_model,
@@ -1263,6 +1285,7 @@ impl MistralRs {
                 no_kv_cache: reboot_state.no_kv_cache,
                 no_prefix_cache: reboot_state.no_prefix_cache,
                 prefix_cache_n: reboot_state.prefix_cache_n,
+                prefix_cache_host_bytes: reboot_state.prefix_cache_host_bytes,
                 disable_eos_stop: reboot_state.disable_eos_stop,
                 throughput_logging_enabled: reboot_state.throughput_logging_enabled,
                 search_embedding_model: reboot_state.search_embedding_model,
@@ -1788,6 +1811,7 @@ impl MistralRs {
             no_kv_cache: engine_config.no_kv_cache,
             no_prefix_cache: engine_config.no_prefix_cache,
             prefix_cache_n: engine_config.prefix_cache_n,
+            prefix_cache_host_bytes: engine_config.prefix_cache_host_bytes,
             disable_eos_stop: engine_config.disable_eos_stop,
             throughput_logging_enabled: engine_config.throughput_logging_enabled,
             search_embedding_model: engine_config.search_embedding_model,
@@ -2128,6 +2152,7 @@ impl MistralRs {
                 no_kv_cache: engine_instance.reboot_state.no_kv_cache,
                 no_prefix_cache: engine_instance.reboot_state.no_prefix_cache,
                 prefix_cache_n: engine_instance.reboot_state.prefix_cache_n,
+                prefix_cache_host_bytes: engine_instance.reboot_state.prefix_cache_host_bytes,
                 disable_eos_stop: engine_instance.reboot_state.disable_eos_stop,
                 throughput_logging_enabled: engine_instance.reboot_state.throughput_logging_enabled,
                 search_embedding_model: engine_instance.reboot_state.search_embedding_model,
@@ -2275,6 +2300,7 @@ impl MistralRs {
             no_kv_cache: unloaded_state.engine_config.no_kv_cache,
             no_prefix_cache: unloaded_state.engine_config.no_prefix_cache,
             prefix_cache_n: unloaded_state.engine_config.prefix_cache_n,
+            prefix_cache_host_bytes: unloaded_state.engine_config.prefix_cache_host_bytes,
             disable_eos_stop: unloaded_state.engine_config.disable_eos_stop,
             throughput_logging_enabled: unloaded_state.engine_config.throughput_logging_enabled,
             search_embedding_model: unloaded_state.engine_config.search_embedding_model,

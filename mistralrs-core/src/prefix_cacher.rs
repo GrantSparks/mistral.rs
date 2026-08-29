@@ -1,12 +1,34 @@
-use candle_core::{Device, Result};
+use candle_core::{Device, Result, Tensor};
 use indexmap::IndexMap;
 use itertools::Itertools;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::{
     kv_cache::RecurrentStateSnapshot, paged_attention::block_hash::BlockHash, pipeline::KvCache,
     sequence::Sequence,
 };
+
+/// Host memory the recurrent-state snapshot store may hold, in bytes.
+///
+/// A hybrid model's snapshot set is one gather of every recurrent layer's
+/// state: for a 48-layer gated-delta-net stack of 48 heads x 128 x 128 f32
+/// that is ~146 MiB per retained prefix. Keeping those sets resident on the
+/// device — which is what this store used to do — spends VRAM that the paged
+/// KV pool and the prefill workspace both need, and it spends it in a way that
+/// byte arithmetic does not predict: a resident store fragments the device
+/// allocator, so long prompts fail to find a contiguous workspace while the
+/// totals still say they fit. Host memory has neither problem, and a set
+/// crosses PCIe 4.0 x16 in tens of milliseconds against the tens of seconds of
+/// prefill that a prefix hit saves. So residency lives on the host and the
+/// bound is stated in bytes of RAM rather than in a sequence count, which never
+/// described what the store actually held.
+///
+/// 64 GiB is ~440 sets of the shape above — far more retention than any served
+/// traffic pattern has been measured to need, and a modest share of the RAM a
+/// machine large enough to serve such a model has. It is a ceiling that keeps
+/// the store from being unbounded, not a target: the store only ever holds what
+/// traffic inserts. Set it to 0 to keep no recurrent snapshots at all.
+pub const DEFAULT_PREFIX_CACHE_HOST_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
 #[derive(PartialEq, Eq, Debug, Hash)]
 struct Tokens(Vec<u32>);
@@ -47,9 +69,37 @@ impl CacheElement {
     }
 }
 
+/// A retained snapshot set, held in host memory with its footprint precomputed
+/// so the store can stay inside its byte bound without re-walking tensors.
+struct HostSnapshotSet {
+    snapshots: Vec<RecurrentStateSnapshot>,
+    bytes: usize,
+}
+
+fn tensor_bytes(tensor: &Tensor) -> usize {
+    tensor.elem_count() * tensor.dtype().size_in_bytes()
+}
+
+fn snapshot_set_bytes(snapshots: &[RecurrentStateSnapshot]) -> usize {
+    snapshots
+        .iter()
+        .map(|snapshot| {
+            tensor_bytes(&snapshot.conv_state) + tensor_bytes(&snapshot.recurrent_state)
+        })
+        .sum()
+}
+
 pub struct PrefixCacheManagerV2 {
     caches: IndexMap<Tokens, CacheElement>,
-    paged_recurrent_caches: IndexMap<Vec<BlockHash>, Vec<RecurrentStateSnapshot>>,
+    /// Recurrent-state snapshots keyed by paged block-hash prefix. Every value
+    /// here is host-resident; see [`DEFAULT_PREFIX_CACHE_HOST_BYTES`].
+    paged_recurrent_caches: IndexMap<Vec<BlockHash>, HostSnapshotSet>,
+    /// Live host footprint of `paged_recurrent_caches`, maintained on every
+    /// insert and eviction.
+    paged_recurrent_host_bytes: usize,
+    /// Ceiling for `paged_recurrent_host_bytes`; the store is trimmed
+    /// oldest-first until it fits.
+    paged_recurrent_host_capacity_bytes: usize,
     n_on_device: usize,
     no_prefix_cache: bool,
     has_paged_attention: bool,
@@ -69,21 +119,32 @@ pub enum MatchingCache {
 }
 
 impl PrefixCacheManagerV2 {
-    pub fn new(n_on_device: usize, no_prefix_cache: bool, has_paged_attention: bool) -> Self {
+    pub fn new(
+        n_on_device: usize,
+        no_prefix_cache: bool,
+        has_paged_attention: bool,
+        host_capacity_bytes: u64,
+    ) -> Self {
         if !no_prefix_cache && !has_paged_attention {
             info!("Prefix caching enabled (sequence-level, non-paged attention). Expect higher multi-turn throughput for both text and multimodal.");
+        }
+        let paged_recurrent_host_capacity_bytes =
+            usize::try_from(host_capacity_bytes).unwrap_or(usize::MAX);
+        if !no_prefix_cache && has_paged_attention {
+            info!(
+                "Recurrent-state prefix snapshots are host-resident, bounded at {} MiB of RAM.",
+                paged_recurrent_host_capacity_bytes / (1024 * 1024)
+            );
         }
         PrefixCacheManagerV2 {
             caches: IndexMap::new(),
             paged_recurrent_caches: IndexMap::new(),
+            paged_recurrent_host_bytes: 0,
+            paged_recurrent_host_capacity_bytes,
             n_on_device,
             no_prefix_cache,
             has_paged_attention,
         }
-    }
-
-    fn paged_recurrent_capacity(&self) -> usize {
-        self.n_on_device.max(1).saturating_mul(8)
     }
 
     /// This always keeps the cache on the device.
@@ -185,35 +246,79 @@ impl PrefixCacheManagerV2 {
         let len = self.caches.len();
         self.caches.clear();
         self.paged_recurrent_caches.clear();
+        self.paged_recurrent_host_bytes = 0;
         Ok(len)
     }
 
     /// Add a recurrent-state snapshot for a paged-attention block-hash prefix key.
     /// This is used by hybrid models to restore recurrent states alongside paged KV prefix hits.
+    ///
+    /// The set is copied to host memory before it is retained, so the device
+    /// keeps only the set being gathered here and the set being scattered back
+    /// on a hit. `to_device` is a no-op for a snapshot that is already
+    /// host-resident, so a CPU pipeline pays nothing for this.
     pub fn add_paged_recurrent_prefix(
         &mut self,
         key: Vec<BlockHash>,
         snapshots: Vec<RecurrentStateSnapshot>,
-    ) {
+    ) -> Result<()> {
         if self.no_prefix_cache
             || !self.has_paged_attention
+            || self.paged_recurrent_host_capacity_bytes == 0
             || key.is_empty()
             || snapshots.is_empty()
         {
-            return;
+            return Ok(());
         }
+
+        let offload_start = std::time::Instant::now();
+        let mut host_snapshots = Vec::with_capacity(snapshots.len());
+        for snapshot in &snapshots {
+            host_snapshots.push(RecurrentStateSnapshot {
+                conv_state: snapshot.conv_state.to_device(&Device::Cpu)?,
+                recurrent_state: snapshot.recurrent_state.to_device(&Device::Cpu)?,
+            });
+        }
+        let bytes = snapshot_set_bytes(&host_snapshots);
+        debug!(
+            "Offloaded a {} MiB recurrent snapshot set to host memory in {:.1} ms",
+            bytes / (1024 * 1024),
+            offload_start.elapsed().as_secs_f64() * 1000.0
+        );
 
         // Maintain LRU order by reinserting on update.
-        let _ = self.paged_recurrent_caches.shift_remove(&key);
-        self.paged_recurrent_caches.insert(key, snapshots);
-
-        while self.paged_recurrent_caches.len() > self.paged_recurrent_capacity() {
-            let _ = self.paged_recurrent_caches.shift_remove_index(0);
+        if let Some(replaced) = self.paged_recurrent_caches.shift_remove(&key) {
+            self.paged_recurrent_host_bytes = self
+                .paged_recurrent_host_bytes
+                .saturating_sub(replaced.bytes);
         }
+        self.paged_recurrent_caches.insert(
+            key,
+            HostSnapshotSet {
+                snapshots: host_snapshots,
+                bytes,
+            },
+        );
+        self.paged_recurrent_host_bytes = self.paged_recurrent_host_bytes.saturating_add(bytes);
+
+        // Intentionally evict the oldest first. A set larger than the whole
+        // bound evicts itself rather than being retained over the bound.
+        while self.paged_recurrent_host_bytes > self.paged_recurrent_host_capacity_bytes {
+            let Some((_, evicted)) = self.paged_recurrent_caches.shift_remove_index(0) else {
+                break;
+            };
+            self.paged_recurrent_host_bytes = self
+                .paged_recurrent_host_bytes
+                .saturating_sub(evicted.bytes);
+        }
+        Ok(())
     }
 
     /// Lookup a recurrent-state snapshot for a paged-attention block-hash prefix key.
     /// Returns a cloned snapshot and updates LRU order.
+    ///
+    /// The returned snapshots are host-resident; restoring them into a device
+    /// pool is what copies them back.
     pub fn get_paged_recurrent_prefix(
         &mut self,
         key: &[BlockHash],
@@ -223,10 +328,15 @@ impl PrefixCacheManagerV2 {
         }
 
         let key = key.to_vec();
-        let snapshots = self.paged_recurrent_caches.shift_remove(&key)?;
-        let out = snapshots.clone();
-        self.paged_recurrent_caches.insert(key, snapshots);
+        let entry = self.paged_recurrent_caches.shift_remove(&key)?;
+        let out = entry.snapshots.clone();
+        self.paged_recurrent_caches.insert(key, entry);
         Some(out)
+    }
+
+    /// Host memory currently held by retained recurrent-state snapshots.
+    pub fn paged_recurrent_host_bytes(&self) -> usize {
+        self.paged_recurrent_host_bytes
     }
 
     pub fn get_longest_paged_recurrent_prefix(
@@ -429,8 +539,12 @@ impl PrefixCacheManagerV2 {
 mod tests {
     use candle_core::{DType, Device, Tensor};
 
-    use super::{CacheElement, MatchingCache, PrefixCacheManagerV2};
-    use crate::kv_cache::{KvCache, RotatingCache, SingleCache};
+    use super::{
+        snapshot_set_bytes, CacheElement, MatchingCache, PrefixCacheManagerV2,
+        DEFAULT_PREFIX_CACHE_HOST_BYTES,
+    };
+    use crate::kv_cache::{KvCache, RecurrentStateSnapshot, RotatingCache, SingleCache};
+    use crate::paged_attention::block_hash::{hash_block_tokens, BlockHash};
 
     fn make_cache_tensor(len: usize) -> candle_core::Result<Tensor> {
         Tensor::zeros((1, 1, len, 1), DType::F32, &Device::Cpu)
@@ -457,9 +571,100 @@ mod tests {
         Ok(KvCache::Normal { k, v })
     }
 
+    /// A snapshot set shaped like a hybrid model's, only small enough to make
+    /// the byte bound easy to state: two recurrent layers of a fixed size.
+    fn make_snapshot_set() -> candle_core::Result<Vec<RecurrentStateSnapshot>> {
+        (0..2)
+            .map(|_| {
+                Ok(RecurrentStateSnapshot {
+                    conv_state: Tensor::zeros((1, 4, 64), DType::F32, &Device::Cpu)?,
+                    recurrent_state: Tensor::zeros((1, 4, 16, 16), DType::F32, &Device::Cpu)?,
+                })
+            })
+            .collect()
+    }
+
+    fn make_key(seed: u32, len: usize) -> Vec<BlockHash> {
+        let mut parent = None;
+        let mut key = Vec::with_capacity(len);
+        for block in 0..len {
+            #[allow(clippy::cast_possible_truncation)]
+            let hash = hash_block_tokens(parent, &[seed, block as u32], None);
+            key.push(hash);
+            parent = Some(hash);
+        }
+        key
+    }
+
+    #[test]
+    fn paged_recurrent_store_is_bounded_in_bytes_and_evicts_oldest_first() -> candle_core::Result<()>
+    {
+        let set_bytes = snapshot_set_bytes(&make_snapshot_set()?);
+        assert!(set_bytes > 0);
+        // Room for exactly three sets.
+        let mut prefix_cacher = PrefixCacheManagerV2::new(1, false, true, (set_bytes * 3) as u64);
+
+        let keys: Vec<_> = (0..3).map(|seed| make_key(seed, 2)).collect();
+        for key in &keys {
+            prefix_cacher.add_paged_recurrent_prefix(key.clone(), make_snapshot_set()?)?;
+        }
+        assert_eq!(prefix_cacher.paged_recurrent_host_bytes(), set_bytes * 3);
+        assert_eq!(prefix_cacher.paged_recurrent_caches.len(), 3);
+
+        // A lookup is a use: it must move that key to the front of the eviction
+        // order, so the next insert takes the genuinely oldest entry instead.
+        assert!(prefix_cacher.get_paged_recurrent_prefix(&keys[0]).is_some());
+        let fourth = make_key(3, 2);
+        prefix_cacher.add_paged_recurrent_prefix(fourth.clone(), make_snapshot_set()?)?;
+
+        assert_eq!(prefix_cacher.paged_recurrent_host_bytes(), set_bytes * 3);
+        assert!(prefix_cacher.get_paged_recurrent_prefix(&keys[1]).is_none());
+        for surviving in [&keys[0], &keys[2], &fourth] {
+            assert!(
+                prefix_cacher
+                    .get_paged_recurrent_prefix(surviving)
+                    .is_some(),
+                "a recently used key was evicted ahead of an older one"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn retained_recurrent_snapshots_are_host_resident() -> candle_core::Result<()> {
+        let mut prefix_cacher =
+            PrefixCacheManagerV2::new(1, false, true, DEFAULT_PREFIX_CACHE_HOST_BYTES);
+        let key = make_key(7, 3);
+        prefix_cacher.add_paged_recurrent_prefix(key.clone(), make_snapshot_set()?)?;
+
+        let restored = prefix_cacher
+            .get_paged_recurrent_prefix(&key)
+            .expect("the set just inserted must be retained");
+        for snapshot in &restored {
+            assert!(snapshot.conv_state.device().is_cpu());
+            assert!(snapshot.recurrent_state.device().is_cpu());
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn a_zero_byte_host_bound_retains_nothing() -> candle_core::Result<()> {
+        let mut prefix_cacher = PrefixCacheManagerV2::new(1, false, true, 0);
+        let key = make_key(11, 2);
+        prefix_cacher.add_paged_recurrent_prefix(key.clone(), make_snapshot_set()?)?;
+
+        assert_eq!(prefix_cacher.paged_recurrent_host_bytes(), 0);
+        assert!(prefix_cacher.get_paged_recurrent_prefix(&key).is_none());
+
+        Ok(())
+    }
+
     #[test]
     fn skips_rolled_over_rotating_candidate_that_cannot_rewind() -> candle_core::Result<()> {
-        let mut prefix_cacher = PrefixCacheManagerV2::new(1, false, false);
+        let mut prefix_cacher =
+            PrefixCacheManagerV2::new(1, false, false, DEFAULT_PREFIX_CACHE_HOST_BYTES);
 
         prefix_cacher.caches.insert(
             vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10].into(),
@@ -502,7 +707,8 @@ mod tests {
 
     #[test]
     fn allows_exact_extension_from_rolled_over_rotating_cache() -> candle_core::Result<()> {
-        let mut prefix_cacher = PrefixCacheManagerV2::new(1, false, false);
+        let mut prefix_cacher =
+            PrefixCacheManagerV2::new(1, false, false, DEFAULT_PREFIX_CACHE_HOST_BYTES);
 
         prefix_cacher.caches.insert(
             vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10].into(),

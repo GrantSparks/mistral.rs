@@ -1067,6 +1067,7 @@ impl MistralRsForServerBuilder {
                 no_kv_cache: self.no_kv_cache,
                 no_prefix_cache: false,
                 prefix_cache_n: self.prefix_cache_n,
+                prefix_cache_host_bytes: mistralrs_core::DEFAULT_PREFIX_CACHE_HOST_BYTES,
                 disable_eos_stop: self.disable_eos_stop,
                 throughput_logging_enabled: !self.interactive_mode,
                 search_embedding_model,
