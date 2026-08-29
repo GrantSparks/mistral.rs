@@ -1961,7 +1961,7 @@ pub trait Pipeline:
                 block_hashes[..n_blocks].to_vec(),
                 snapshots,
                 auxiliary,
-            );
+            )?;
         }
         Ok(())
     }

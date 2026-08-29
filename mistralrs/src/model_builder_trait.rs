@@ -412,6 +412,7 @@ pub(crate) fn build_engine_config(
         no_kv_cache,
         no_prefix_cache: prefix_cache_n.is_none(),
         prefix_cache_n: prefix_cache_n.unwrap_or(16),
+        prefix_cache_host_bytes: mistralrs_core::DEFAULT_PREFIX_CACHE_HOST_BYTES,
         disable_eos_stop: false,
     }
 }
