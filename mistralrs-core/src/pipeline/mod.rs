@@ -1911,7 +1911,7 @@ pub trait Pipeline:
 
     fn snapshot_paged_recurrent_prefix(
         &mut self,
-        seq: &Sequence,
+        seq: &mut Sequence,
         prefix_cacher: &mut PrefixCacheManagerV2,
         block_size: usize,
         cached_tokens: usize,
@@ -1929,10 +1929,18 @@ pub trait Pipeline:
 
         self.flush_recurrent_speculative_transitions(&[*seq.id()])?;
 
+        if let Some(observation) = seq.snapshot_observation_mut() {
+            observation.begin_snapshot_write();
+        }
         let snapshots = self
             .cache()
             .hybrid()
-            .snapshot_recurrent_state(*seq.id(), slot_idx)?;
+            .snapshot_recurrent_state(*seq.id(), slot_idx)
+            .inspect_err(|_| {
+                if let Some(observation) = seq.snapshot_observation_mut() {
+                    observation.snapshot_write_failed();
+                }
+            })?;
         if snapshots.is_empty() {
             return Ok(());
         }
@@ -1956,11 +1964,12 @@ pub trait Pipeline:
             let owner = *block_hashes
                 .last()
                 .expect("recurrent prefix owner requires a full block");
-            prefix_cacher.add_paged_recurrent_prefix(
+            prefix_cacher.add_paged_recurrent_observed(
                 owner,
                 block_hashes[..n_blocks].to_vec(),
                 snapshots,
                 auxiliary,
+                seq.snapshot_observation_mut(),
             )?;
         }
         Ok(())
@@ -2368,6 +2377,36 @@ pub trait Pipeline:
                     || chunk_plans
                         .as_ref()
                         .is_some_and(|plans| plans.iter().any(|plan| plan.len() > 1));
+                if is_prompt && mistralrs_quant::serving_observation::enabled() {
+                    let metadata = self.get_metadata();
+                    let kv_dtype = metadata.cache_config.as_ref().map(|config| {
+                        format!(
+                            "{:?}",
+                            config.cache_type.to_dtype(metadata.activation_dtype)
+                        )
+                    });
+                    for (idx, seq) in input_seqs.iter_mut().enumerate() {
+                        let suffix = seq.get_toks().len().saturating_sub(seq.prefix_cache_len());
+                        let (count, max_tokens) =
+                            chunk_plans.as_ref().map_or((1, suffix), |plans| {
+                                (
+                                    plans[idx].len(),
+                                    plans[idx]
+                                        .iter()
+                                        .map(|chunk| chunk.end - chunk.start)
+                                        .max()
+                                        .unwrap_or(0),
+                                )
+                            });
+                        let observation = &mut seq.engine_observation;
+                        observation.activation_dtype =
+                            Some(format!("{:?}", metadata.activation_dtype));
+                        observation.kv_dtype = kv_dtype.clone();
+                        observation.paged_block_size = Some(block_size);
+                        observation.prefill_chunk_count = Some(count);
+                        observation.prefill_chunk_max_tokens = Some(max_tokens);
+                    }
+                }
                 let cuda_decode_lookahead = lookahead.is_enabled()
                     && !is_prompt
                     && !return_raw_logits
@@ -2595,18 +2634,45 @@ pub trait Pipeline:
                             hybrid_cache.install_sequence_state_indices(&sequence_slots)?;
                         }
                         let start = Instant::now();
-                        #[cfg(feature = "cuda")]
-                        let forward = if cuda_decode_lookahead {
-                            self.forward_step(inputs, return_raw_logits)?
-                        } else {
-                            ForwardStepResult::eager(
+                        // Label this synchronous host dispatch for the route counters; the
+                        // scope is thread-bound and never crosses an await.
+                        let forward = {
+                            let phase = if is_prompt {
+                                mistralrs_quant::serving_observation::HostDispatchPhase::Prefill
+                            } else {
+                                mistralrs_quant::serving_observation::HostDispatchPhase::Decode
+                            };
+                            let _phase_scope =
+                                mistralrs_quant::serving_observation::HostDispatchScope::enter(
+                                    phase,
+                                );
+                            #[cfg(feature = "cuda")]
+                            let forward = if cuda_decode_lookahead {
+                                self.forward_step(inputs, return_raw_logits)?
+                            } else {
+                                ForwardStepResult::eager(
+                                    self.forward_inputs(inputs, return_raw_logits)?,
+                                )
+                            };
+                            #[cfg(not(feature = "cuda"))]
+                            let forward = ForwardStepResult::eager(
                                 self.forward_inputs(inputs, return_raw_logits)?,
-                            )
+                            );
+                            forward
                         };
-                        #[cfg(not(feature = "cuda"))]
-                        let forward = ForwardStepResult::eager(
-                            self.forward_inputs(inputs, return_raw_logits)?,
-                        );
+                        if mistralrs_quant::serving_observation::enabled() {
+                            let host_forward_sec = start.elapsed().as_secs_f64();
+                            for &seq_idx in &seq_indices {
+                                let observation = &mut input_seqs[seq_idx].engine_observation;
+                                if is_prompt {
+                                    observation.prefill_host_forward_sec = Some(
+                                        observation.prefill_host_forward_sec.unwrap_or(0.0)
+                                            + host_forward_sec,
+                                    );
+                                }
+                                crate::serving_observation::populate(observation);
+                            }
+                        }
                         #[cfg(feature = "cuda")]
                         let mut cuda_decode = forward.cuda_decode;
                         let raw_logits = forward
@@ -2627,7 +2693,7 @@ pub trait Pipeline:
 
                         for (seq_idx, end) in recurrent_boundaries {
                             self.snapshot_paged_recurrent_prefix(
-                                &*input_seqs[seq_idx],
+                                &mut *input_seqs[seq_idx],
                                 prefix_cacher,
                                 block_size,
                                 end,

@@ -234,6 +234,11 @@ pub(crate) fn record_cuda_graph_dispatch(
     mode: CudaGraphDispatchMode,
     reason: CudaGraphDispatchReason,
 ) {
+    if let Some(event) =
+        crate::serving_observation::graph_event_for_dispatch(component, mode, reason)
+    {
+        crate::serving_observation::record_graph(event);
+    }
     let labels = cuda_graph_dispatch_labels(component, mode, reason);
     metrics::counter!(
         CUDA_GRAPH_DISPATCH_METRIC,
@@ -293,6 +298,13 @@ fn record_cuda_graph_event(
     event: CudaGraphEvent,
     outcome: CudaGraphOutcome,
 ) {
+    for &graph_event in crate::serving_observation::graph_events_for_event(
+        component,
+        event,
+        outcome == CudaGraphOutcome::Success,
+    ) {
+        crate::serving_observation::record_graph(graph_event);
+    }
     let labels = cuda_graph_event_labels(component, event, outcome);
     metrics::counter!(
         CUDA_GRAPH_EVENTS_METRIC,

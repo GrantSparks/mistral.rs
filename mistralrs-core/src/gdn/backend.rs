@@ -449,6 +449,7 @@ fn recurrence_cuda_from_convolved(
     let slots = GdnStateSlots::from_option(cache.slots.as_ref());
 
     let output = if seq_len == 1 {
+        crate::serving_observation::GDN_FUSED_DECODE.record();
         RecurrenceOutput::BatchHeadMajor(crate::cuda::gdn::fused_decode_recurrence_cuda(
             FusedDecodeRecurrence {
                 mixed_qkv: &mixed_qkv,

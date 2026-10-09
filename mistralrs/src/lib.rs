@@ -243,17 +243,18 @@ pub use messages::{
     MultimodalMessages, RequestBuilder, RequestLike, TextMessageRole, TextMessages,
 };
 pub use mistralrs_core::{
+    inference_observations_enabled, AgentPermission, AgentToolApproval,
+    AgentToolApprovalAsyncCallback, AgentToolApprovalCallback, AgentToolApprovalDecision,
+    AgentToolApprovalFuture, AgentToolApprovalHandler, AgentToolKind, AgentToolMetadata,
+    AgentToolSource, CodeExecutionApproval, CodeExecutionApprovalCallback, CodeExecutionConfig,
+    CodeExecutionPermission, NetworkMode, SandboxPolicy, ShellConfig, ShellOptions,
+    ShellSkillMount,
+};
+pub use mistralrs_core::{
     AdapterGenerationId, AdapterSelection, LoraAdapterError, LoraAdapterInfo,
     LoraAdapterLoadPolicy, LoraAdapterRoute, LoraAdapterSpec, LoraResidentGenerationInfo,
     LoraRuntimeConfig, LoraRuntimeStatus, DEFAULT_LORA_MAX_ADAPTERS, DEFAULT_LORA_MAX_BYTES,
     DEFAULT_LORA_MAX_RANK, MAX_LORA_ALIAS_BYTES,
-};
-pub use mistralrs_core::{
-    AgentPermission, AgentToolApproval, AgentToolApprovalAsyncCallback, AgentToolApprovalCallback,
-    AgentToolApprovalDecision, AgentToolApprovalFuture, AgentToolApprovalHandler, AgentToolKind,
-    AgentToolMetadata, AgentToolSource, CodeExecutionApproval, CodeExecutionApprovalCallback,
-    CodeExecutionConfig, CodeExecutionPermission, NetworkMode, SandboxPolicy, ShellConfig,
-    ShellOptions, ShellSkillMount,
 };
 pub use mistralrs_core::{
     AgenticToolCallRecord, File, FileContent, FileSource, RequestedFile, MODEL_INLINE_BYTES,
@@ -288,7 +289,8 @@ pub mod core;
 // ========== Response Types ==========
 pub use mistralrs_core::{
     BlockDenoisingProgress, ChatCompletionChunkResponse, ChatCompletionResponse, Choice,
-    ChunkChoice, CompletionResponse, Delta, Logprobs, Response, ResponseMessage, TopLogprob, Usage,
+    ChunkChoice, CompletionResponse, Delta, EngineObservation, Logprobs, Response, ResponseMessage,
+    TopLogprob, Usage,
 };
 
 // ========== Request Types ==========

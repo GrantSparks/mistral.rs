@@ -322,6 +322,7 @@ impl QuantMethod for BlockwiseFP8Linear {
                 return Tensor::zeros(output_shape, x.dtype(), x.device());
             }
             let input = x.reshape((rows, features))?;
+            crate::serving_observation::FP8_NATIVE.record();
             let result = crate::cutile::cutile_fp8_w8a16(
                 &input,
                 &self.weight,
@@ -356,6 +357,7 @@ impl QuantMethod for BlockwiseFP8Linear {
                         candle_core::Error::msg("FP8 activation shape overflows usize")
                     })?;
                 let input = x.reshape((rows, features))?;
+                crate::serving_observation::FP8_NATIVE.record();
                 let result = if deepgemm::serving_supported(&input) {
                     deepgemm::matmul(prepared, &input, &self.weight, &self.weight_scale_inv)?
                 } else {
@@ -393,6 +395,9 @@ impl QuantMethod for BlockwiseFP8Linear {
                 let activation = self.quantize_activation(x)?;
                 return self.forward_quantized(&activation);
             }
+            // Dense BF16 GEMM over the dequantized weight: upstream's route for
+            // activations the W8A8 tensor-core GEMV does not accept (rows > 32).
+            crate::serving_observation::FP8_DEQUANT.record();
             let weight = self.dequantize_w()?;
             let unquant = UnquantLinear::new(QuantMethodConfig::Unquantized(Linear::new(
                 weight,
@@ -419,6 +424,7 @@ impl QuantMethod for BlockwiseFP8Linear {
                 };
 
                 // Use native FP8 GEMM kernel
+                crate::serving_observation::FP8_NATIVE.record();
                 let result = ops::fp8_blockwise_matmul(
                     &x_2d,
                     &self.weight,
@@ -445,6 +451,7 @@ impl QuantMethod for BlockwiseFP8Linear {
         }
 
         // Fallback: dequantize and use unquantized matmul
+        crate::serving_observation::FP8_DEQUANT.record();
         let weight = self.dequantize_w()?;
         // Dispatch to unquant. This uses some cublaslt for bias & on cuda always, so it is better
         let unquant = UnquantLinear::new(QuantMethodConfig::Unquantized(Linear::new(
@@ -674,6 +681,7 @@ impl QuantMethod for BlockwiseFP8Linear {
     fn forward_quantized(&self, activation: &QuantizedActivation) -> Result<Tensor> {
         #[cfg(all(feature = "cuda", has_blockwise_fp8_kernels))]
         if matches!(self.provider, BlockwiseFp8Provider::TensorCoreGemv) {
+            crate::serving_observation::FP8_NATIVE.record();
             #[cfg(feature = "cutile")]
             if activation.scale_layout() == Self::cutile_scale_layout() {
                 return self.forward_cutile_quantized(activation);
@@ -706,6 +714,7 @@ impl QuantMethod for BlockwiseFP8Linear {
                     scheme
                 )
             }
+            crate::serving_observation::FP8_NATIVE.record();
             let result = match activation.scale_layout() {
                 ActivationScaleLayout::RowMajor => ops::fp8_blockwise_matmul_cutlass(
                     activation.quantized(),

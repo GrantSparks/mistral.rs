@@ -810,6 +810,7 @@ pub(crate) async fn finish_verified_step<P: Pipeline>(
     disable_eos_stop: bool,
     rng: Arc<std::sync::Mutex<Isaac64Rng>>,
 ) -> Result<VerificationOutcome> {
+    seq.disable_exact_observation();
     let rng = seq.sampling_rng(&rng);
     let VerificationInput {
         verify_logits,

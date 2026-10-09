@@ -137,6 +137,7 @@ impl QuantMethod for UnquantLinear {
         // Try custom GEMV for single-token decode (batch_size=1)
         #[cfg(feature = "cuda")]
         if crate::gemv::should_use_gemv(a, &self.w) {
+            crate::serving_observation::UNQUANT_GEMV.record();
             return crate::gemv::gemv(a, &self.w, self.b.as_ref());
         }
 
@@ -144,6 +145,7 @@ impl QuantMethod for UnquantLinear {
 
         #[cfg(feature = "cuda")]
         if crate::gemv::should_use_wide_gemv(a, &self.w) {
+            crate::serving_observation::UNQUANT_GEMV.record();
             let output = crate::gemv::gemv(a, &self.w, None)?;
             return match self.b.as_ref() {
                 Some(bias) => output.broadcast_add(bias),
@@ -151,6 +153,7 @@ impl QuantMethod for UnquantLinear {
             };
         }
 
+        crate::serving_observation::UNQUANT_MATMUL.record();
         if a.device().is_cuda() && a.rank() > 2 {
             return self.forward_cuda_gemm(a);
         }

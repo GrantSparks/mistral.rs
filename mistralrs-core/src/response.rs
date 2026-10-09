@@ -11,6 +11,162 @@ use serde::Serialize;
 
 use crate::{sampler::TopLogprob, tools::ToolCallResponse};
 
+#[cfg_attr(feature = "pyo3_macros", pyclass)]
+#[cfg_attr(feature = "pyo3_macros", pyo3(get_all))]
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
+#[serde(default)]
+/// Sequence-local causal output markers and explicitly worker-wide dispatch counters.
+/// Accepted output includes EOS, stop and nonvisible tokens; rejected candidates and drafts are excluded.
+pub struct EngineObservation {
+    pub sequence_id: usize,
+    pub clock_origin: String,
+    pub clock_anchor_unavailable: String,
+    pub sequence_origin_utc_unix_ns: Option<u64>,
+    pub sequence_origin_uncertainty_ns: Option<u64>,
+    pub activation_dtype: Option<String>,
+    pub kv_dtype: Option<String>,
+    pub paged_block_size: Option<usize>,
+    pub worker_graph_capture_attempts: usize,
+    pub worker_graph_capture_successes: usize,
+    pub worker_graph_failures: usize,
+    pub worker_graph_replays: usize,
+    pub worker_graph_eligible: usize,
+    pub worker_graph_eager_reason: String,
+    pub graph_requested: bool,
+    pub graph_counter_scope: String,
+    pub build_cuda: bool,
+    pub build_flash_attn: bool,
+    pub build_metal: bool,
+    pub worker_gdn_fused_decode: usize,
+    pub token_count_convention: String,
+    pub worker_fp8_native_prefill: usize,
+    pub worker_fp8_native_decode: usize,
+    pub worker_fp8_native_unknown: usize,
+    pub worker_fp8_dequant_prefill: usize,
+    pub worker_fp8_dequant_decode: usize,
+    pub worker_fp8_dequant_unknown: usize,
+    pub worker_unquant_gemv_prefill: usize,
+    pub worker_unquant_gemv_decode: usize,
+    pub worker_unquant_gemv_unknown: usize,
+    pub worker_unquant_matmul_prefill: usize,
+    pub worker_unquant_matmul_decode: usize,
+    pub worker_unquant_matmul_unknown: usize,
+    pub worker_gdn_fused_decode_prefill: usize,
+    pub worker_gdn_fused_decode_decode: usize,
+    pub worker_gdn_fused_decode_unknown: usize,
+    pub worker_fp8_native: usize,
+    pub worker_fp8_dequant: usize,
+    pub worker_unquant_gemv: usize,
+    pub worker_unquant_matmul: usize,
+    pub kernel_counter_scope: String,
+    pub response_index: usize,
+    pub prompt_tokens: usize,
+    pub candidate_prefix_tokens: Option<usize>,
+    pub recurrent_restored_tokens: Option<usize>,
+    pub reused_prefix_tokens: Option<usize>,
+    pub uncached_suffix_tokens: Option<usize>,
+    pub cache_outcome: Option<String>,
+    pub recurrent_outcome: Option<String>,
+    pub prefix_lookup_sec: Option<f64>,
+    pub recurrent_lookup_sec: Option<f64>,
+    pub recurrent_restore_sec: Option<f64>,
+    pub snapshot_host_bytes: Option<usize>,
+    pub snapshot_entries: Option<usize>,
+    pub snapshot_capacity_bytes: Option<usize>,
+    pub snapshot_placement: Option<String>,
+    pub snapshot_write_count: Option<u64>,
+    pub snapshot_write_bytes: Option<u64>,
+    pub snapshot_evicted_entries: Option<u64>,
+    pub snapshot_evicted_bytes: Option<u64>,
+    pub snapshot_host_copy_ns: Option<u64>,
+    pub snapshot_write_measurement_complete: Option<bool>,
+    pub prefill_chunk_count: Option<usize>,
+    pub prefill_chunk_max_tokens: Option<usize>,
+    pub prefill_host_forward_sec: Option<f64>,
+    pub first_token_sequence_elapsed_ns: Option<u64>,
+    pub last_token_sequence_elapsed_ns: Option<u64>,
+    pub sampled_tokens: usize,
+    pub final_token_marker: bool,
+    pub finish_reason: Option<String>,
+    pub token_marker_boundary: String,
+    pub kernel_phase_unavailable: String,
+    pub raw_prompt_sec: f64,
+    pub raw_completion_sec: f64,
+}
+
+impl EngineObservation {
+    pub(crate) fn begin_snapshot_write(&mut self) {
+        self.snapshot_write_count.get_or_insert(0);
+        self.snapshot_write_bytes.get_or_insert(0);
+        self.snapshot_evicted_entries.get_or_insert(0);
+        self.snapshot_evicted_bytes.get_or_insert(0);
+        self.snapshot_host_copy_ns.get_or_insert(0);
+        self.snapshot_write_measurement_complete.get_or_insert(true);
+    }
+
+    pub(crate) fn snapshot_write_failed(&mut self) {
+        self.begin_snapshot_write();
+        self.snapshot_write_measurement_complete = Some(false);
+    }
+
+    pub(crate) fn record_snapshot_write(
+        &mut self,
+        outcome: &crate::prefix_cacher::SnapshotWriteOutcome,
+    ) {
+        for (counter, delta) in [
+            (&mut self.snapshot_write_count, outcome.written_count),
+            (&mut self.snapshot_write_bytes, outcome.written_bytes),
+            (&mut self.snapshot_evicted_entries, outcome.evicted_entries),
+            (&mut self.snapshot_evicted_bytes, outcome.evicted_bytes),
+        ] {
+            *counter = Some(counter.unwrap_or(0).saturating_add(delta));
+        }
+    }
+
+    pub(crate) fn accepted_token(&mut self, elapsed_ns: u64) {
+        self.first_token_sequence_elapsed_ns
+            .get_or_insert(elapsed_ns);
+        self.last_token_sequence_elapsed_ns = Some(elapsed_ns);
+        self.sampled_tokens = self.sampled_tokens.saturating_add(1);
+    }
+
+    pub(crate) fn recurrent_restore(&mut self, restored: bool, boundary: usize) {
+        self.recurrent_restored_tokens = Some(if restored { boundary } else { 0 });
+        self.recurrent_outcome = Some(
+            if restored {
+                "restored"
+            } else {
+                "restore_failed"
+            }
+            .into(),
+        );
+    }
+
+    pub(crate) fn recurrent_miss(&mut self, reason: &str) {
+        self.recurrent_outcome = Some(reason.into());
+        self.recurrent_restored_tokens = Some(0);
+    }
+
+    pub(crate) fn prefix_candidate(&mut self, enabled: bool, candidate: usize) {
+        self.candidate_prefix_tokens = Some(candidate);
+        self.cache_outcome = Some(
+            if !enabled {
+                "disabled"
+            } else if candidate == 0 {
+                "no_matching_kv_prefix"
+            } else {
+                "candidate_hit"
+            }
+            .into(),
+        );
+    }
+
+    pub(crate) fn final_prefix(&mut self, prompt_tokens: usize, reused: usize) {
+        self.reused_prefix_tokens = Some(reused);
+        self.uncached_suffix_tokens = Some(prompt_tokens.saturating_sub(reused));
+    }
+}
+
 pub const SYSTEM_FINGERPRINT: &str = "local";
 
 macro_rules! generate_repr {
@@ -125,7 +281,7 @@ generate_repr!(CompletionChunkChoice);
 
 #[cfg_attr(feature = "pyo3_macros", pyclass)]
 #[cfg_attr(feature = "pyo3_macros", pyo3(get_all))]
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 /// OpenAI compatible prompt token breakdown.
 pub struct PromptTokensDetails {
     /// Prompt tokens served from the prefix cache, not recomputed.
@@ -136,9 +292,11 @@ generate_repr!(PromptTokensDetails);
 
 #[cfg_attr(feature = "pyo3_macros", pyclass)]
 #[cfg_attr(feature = "pyo3_macros", pyo3(get_all))]
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 /// OpenAI compatible (superset) usage during a request.
 pub struct Usage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_observation: Option<EngineObservation>,
     pub completion_tokens: usize,
     pub prompt_tokens: usize,
     pub total_tokens: usize,
@@ -559,5 +717,94 @@ impl Response {
             }),
             Self::File(f) => Ok(ResponseOk::File(f)),
         }
+    }
+}
+
+#[cfg(test)]
+mod observation_contract_tests {
+    use super::*;
+
+    #[test]
+    fn observation_contract_token_markers_include_terminal_sample() {
+        let mut observation = EngineObservation::default();
+        observation.accepted_token(100);
+        observation.accepted_token(350);
+        observation.final_token_marker = true;
+        assert_eq!(observation.sampled_tokens, 2);
+        assert_eq!(observation.first_token_sequence_elapsed_ns, Some(100));
+        assert_eq!(observation.last_token_sequence_elapsed_ns, Some(350));
+    }
+
+    #[test]
+    fn observation_contract_final_clamp_keeps_candidate_and_restore_boundary() {
+        let mut observation = EngineObservation {
+            candidate_prefix_tokens: Some(96),
+            recurrent_restored_tokens: Some(64),
+            ..Default::default()
+        };
+        observation.final_prefix(101, 32);
+        assert_eq!(observation.candidate_prefix_tokens, Some(96));
+        assert_eq!(observation.recurrent_restored_tokens, Some(64));
+        assert_eq!(observation.reused_prefix_tokens, Some(32));
+        assert_eq!(observation.uncached_suffix_tokens, Some(69));
+    }
+
+    #[test]
+    fn observation_contract_restore_failed_is_distinct_from_hit() {
+        let mut observation = EngineObservation::default();
+        observation.recurrent_restore(false, 64);
+        assert_eq!(observation.recurrent_restored_tokens, Some(0));
+        assert_eq!(
+            observation.recurrent_outcome.as_deref(),
+            Some("restore_failed")
+        );
+        observation.recurrent_restore(true, 64);
+        assert_eq!(observation.recurrent_restored_tokens, Some(64));
+        assert_eq!(observation.recurrent_outcome.as_deref(), Some("restored"));
+    }
+
+    #[test]
+    fn observation_contract_snapshot_fields_are_optional_and_roundtrip() {
+        let legacy: EngineObservation =
+            serde_json::from_str("{}").expect("legacy engine observation");
+        assert_eq!(legacy.snapshot_write_count, None);
+        assert_eq!(legacy.snapshot_host_copy_ns, None);
+        assert_eq!(legacy.snapshot_write_measurement_complete, None);
+        let observed = EngineObservation {
+            snapshot_write_count: Some(2),
+            snapshot_write_bytes: Some(4096),
+            snapshot_evicted_entries: Some(1),
+            snapshot_evicted_bytes: Some(2048),
+            snapshot_host_copy_ns: Some(123),
+            snapshot_write_measurement_complete: Some(false),
+            ..Default::default()
+        };
+        let encoded = serde_json::to_string(&observed).expect("snapshot observations serialize");
+        let decoded: EngineObservation =
+            serde_json::from_str(&encoded).expect("snapshot observations deserialize");
+        assert_eq!(decoded.snapshot_write_count, observed.snapshot_write_count);
+        assert_eq!(decoded.snapshot_write_bytes, observed.snapshot_write_bytes);
+        assert_eq!(
+            decoded.snapshot_evicted_entries,
+            observed.snapshot_evicted_entries
+        );
+        assert_eq!(
+            decoded.snapshot_evicted_bytes,
+            observed.snapshot_evicted_bytes
+        );
+        assert_eq!(
+            decoded.snapshot_host_copy_ns,
+            observed.snapshot_host_copy_ns
+        );
+        assert_eq!(decoded.snapshot_write_measurement_complete, Some(false));
+    }
+
+    #[test]
+    fn observation_contract_legacy_usage_has_unknown_observation() {
+        let usage: Usage = serde_json::from_str(r#"{"completion_tokens":1,"prompt_tokens":2,"total_tokens":3,"avg_tok_per_sec":0.0,"avg_prompt_tok_per_sec":0.0,"avg_compl_tok_per_sec":0.0,"total_time_sec":0.0,"total_prompt_time_sec":0.0,"total_completion_time_sec":0.0}"#).expect("legacy fixture");
+        assert!(usage.engine_observation.is_none());
+        let observation: EngineObservation = serde_json::from_str("{}").expect("optional fields");
+        assert!(observation.candidate_prefix_tokens.is_none());
+        assert!(observation.first_token_sequence_elapsed_ns.is_none());
     }
 }

@@ -1001,8 +1001,11 @@ impl PagedAttentionScheduler {
                 .unwrap_or_default();
 
             // Look up prefix cache hits
+            let lookup_start =
+                mistralrs_quant::serving_observation::enabled().then(std::time::Instant::now);
             let kv_mgr = get_mut_arcmutex!(self.kv_cache_manager);
-            let mut computed = if self.prefix_caching_enabled && !return_raw_logits {
+            let prefix_lookup_enabled = self.prefix_caching_enabled && !return_raw_logits;
+            let mut computed = if prefix_lookup_enabled {
                 kv_mgr.get_computed_blocks(block_hashes, num_tokens)
             } else {
                 super::kv_cache_manager::ComputedBlocks {
@@ -1011,6 +1014,12 @@ impl PagedAttentionScheduler {
                 }
             };
             drop(kv_mgr);
+            if let Some(lookup_start) = lookup_start {
+                let mut seq_guard = get_mut_arcmutex!(seq);
+                let observation = &mut seq_guard.engine_observation;
+                observation.prefix_candidate(prefix_lookup_enabled, computed.num_computed_tokens);
+                observation.prefix_lookup_sec = Some(lookup_start.elapsed().as_secs_f64());
+            }
 
             let clamped = {
                 let seq_guard = get_mut_arcmutex!(seq);

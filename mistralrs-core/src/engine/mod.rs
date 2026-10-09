@@ -302,6 +302,8 @@ struct HybridPrefixRestore {
     restore_auxiliary: bool,
     replay_tokens_avoided: usize,
     record_auxiliary_miss: bool,
+    /// Host elapsed seconds of the checkpoint lookup, when observed.
+    lookup_sec: Option<f64>,
 }
 
 impl HybridPagedPrefixValidator {
@@ -311,10 +313,24 @@ impl HybridPagedPrefixValidator {
         slot_idx: usize,
         record_auxiliary_miss: bool,
         validation_reason: &'static str,
+        candidate_tokens: usize,
+        lookup_sec: Option<f64>,
     ) -> PagedPrefixCacheValidation {
         let pipeline = Arc::clone(&self.pipeline);
+        let prefix_cacher = Arc::clone(&self.prefix_cacher);
         PagedPrefixCacheValidation::staged(0, move |seq| {
             debug_assert_eq!(*seq.id(), sequence_id);
+            if let Some(observation) = seq.snapshot_observation_mut() {
+                get_mut_arcmutex!(prefix_cacher).observe_recurrent_lookup(
+                    observation,
+                    lookup_sec,
+                    false,
+                );
+                observation.recurrent_miss(crate::serving_observation::recurrent_miss_reason(
+                    validation_reason,
+                    candidate_tokens,
+                ));
+            }
             let mut pipeline = get_mut_arcmutex!(pipeline);
             if pipeline.cache().is_hybrid() {
                 pipeline.cache().hybrid().reset_seq(sequence_id, slot_idx)?;
@@ -333,6 +349,13 @@ impl HybridPagedPrefixValidator {
         let prefix_cacher = Arc::clone(&self.prefix_cacher);
         PagedPrefixCacheValidation::staged(restore.cached_tokens, move |seq| {
             debug_assert_eq!(*seq.id(), restore.sequence_id);
+            if let Some(observation) = seq.snapshot_observation_mut() {
+                get_mut_arcmutex!(prefix_cacher).observe_recurrent_lookup(
+                    observation,
+                    restore.lookup_sec,
+                    true,
+                );
+            }
             let mut pipeline = get_mut_arcmutex!(pipeline);
             pipeline.release_speculative_sequences(&[restore.sequence_id])?;
             if restore.restore_auxiliary {
@@ -348,11 +371,19 @@ impl HybridPagedPrefixValidator {
                 )?;
             }
             if pipeline.cache().is_hybrid() {
-                pipeline.cache().hybrid().restore_recurrent_state(
+                let restore_start = seq.snapshot_observation_mut().is_some().then(Instant::now);
+                let restored = pipeline.cache().hybrid().restore_recurrent_state(
                     restore.sequence_id,
                     restore.slot_idx,
                     &restore.checkpoint.recurrent_snapshots,
-                )?;
+                );
+                if let (Some(start), Some(observation)) =
+                    (restore_start, seq.snapshot_observation_mut())
+                {
+                    observation.recurrent_restore_sec = Some(start.elapsed().as_secs_f64());
+                    observation.recurrent_restore(restored.is_ok(), restore.cached_tokens);
+                }
+                restored?;
             }
             drop(pipeline);
             get_mut_arcmutex!(prefix_cacher)
@@ -386,12 +417,27 @@ impl PagedPrefixCacheValidator for HybridPagedPrefixValidator {
         block_size: usize,
     ) -> candle_core::Result<PagedPrefixCacheValidation> {
         let Some(slot_idx) = seq.recurrent_state_idx() else {
-            return Ok(PagedPrefixCacheValidation::staged(0, |_| {
+            let prefix_cacher = Arc::clone(&self.prefix_cacher);
+            return Ok(PagedPrefixCacheValidation::staged(0, move |seq| {
+                if let Some(observation) = seq.snapshot_observation_mut() {
+                    get_mut_arcmutex!(prefix_cacher).observe_recurrent_lookup(
+                        observation,
+                        None,
+                        false,
+                    );
+                    observation.recurrent_miss(crate::serving_observation::recurrent_miss_reason(
+                        "missing_slot",
+                        cached_tokens,
+                    ));
+                }
                 record_paged_recurrent_prefix_validation("miss", "missing_slot");
                 Ok(())
             }));
         };
         let sequence_id = *seq.id();
+        let candidate_tokens = cached_tokens;
+        let lookup_start =
+            mistralrs_quant::serving_observation::enabled().then(std::time::Instant::now);
 
         let prefix_policy = {
             let pipeline = get_mut_arcmutex!(self.pipeline);
@@ -428,6 +474,7 @@ impl PagedPrefixCacheValidator for HybridPagedPrefixValidator {
                             restore_auxiliary: true,
                             replay_tokens_avoided: replay_tokens,
                             record_auxiliary_miss: false,
+                            lookup_sec: lookup_start.map(|start| start.elapsed().as_secs_f64()),
                         }));
                     }
                 }
@@ -452,6 +499,8 @@ impl PagedPrefixCacheValidator for HybridPagedPrefixValidator {
                 slot_idx,
                 record_auxiliary_miss,
                 "no_replay_boundary",
+                candidate_tokens,
+                lookup_start.map(|start| start.elapsed().as_secs_f64()),
             ));
         };
 
@@ -461,26 +510,39 @@ impl PagedPrefixCacheValidator for HybridPagedPrefixValidator {
                 slot_idx,
                 record_auxiliary_miss,
                 "unaligned_boundary",
+                candidate_tokens,
+                lookup_start.map(|start| start.elapsed().as_secs_f64()),
             ));
         }
 
         let max_blocks = cached_tokens / block_size;
-        let Some((n_blocks, checkpoint)) = get_mut_arcmutex!(self.prefix_cacher)
-            .peek_longest_paged_recurrent_prefix(block_hashes, max_blocks)
-        else {
+        let checkpoint = get_mut_arcmutex!(self.prefix_cacher)
+            .peek_longest_paged_recurrent_prefix(block_hashes, max_blocks);
+        let lookup_sec = lookup_start.map(|start| start.elapsed().as_secs_f64());
+        let Some((n_blocks, checkpoint)) = checkpoint else {
             return Ok(self.stage_recurrent_reset(
                 sequence_id,
                 slot_idx,
                 record_auxiliary_miss,
                 "checkpoint_unavailable",
+                candidate_tokens,
+                lookup_sec,
             ));
         };
 
         let pipeline = get_mut_arcmutex!(self.pipeline);
         if !pipeline.cache().is_hybrid() {
+            let prefix_cacher = Arc::clone(&self.prefix_cacher);
             return Ok(PagedPrefixCacheValidation::staged(
                 cached_tokens,
-                move |_| {
+                move |seq| {
+                    if let Some(observation) = seq.snapshot_observation_mut() {
+                        get_mut_arcmutex!(prefix_cacher).observe_recurrent_lookup(
+                            observation,
+                            lookup_sec,
+                            true,
+                        );
+                    }
                     record_paged_recurrent_prefix_validation("hit", "attention_only");
                     if record_auxiliary_miss {
                         metrics::counter!("mistralrs_speculative_prefix_cache_misses_total")
@@ -503,6 +565,7 @@ impl PagedPrefixCacheValidator for HybridPagedPrefixValidator {
             restore_auxiliary: false,
             replay_tokens_avoided: 0,
             record_auxiliary_miss,
+            lookup_sec,
         }))
     }
 
@@ -2165,7 +2228,7 @@ impl Engine {
                                 && pipeline.cache().is_hybrid()
                                 && prefix_cacher.accepts_paged_recurrent_prefix()
                             {
-                                for seq in guards_mut.iter() {
+                                for seq in guards_mut.iter_mut() {
                                     if matches!(
                                         prefix_policy.replay_for(modality_signature(seq)),
                                         crate::speculative::SpeculativePrefixReplay::Full

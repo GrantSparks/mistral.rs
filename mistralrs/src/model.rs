@@ -1132,6 +1132,21 @@ impl Model {
             .map_err(|e| SdkError::Inference(e.into()))
     }
 
+    /// Return the default model's accepted recurrent snapshot host capacity, not current occupancy.
+    pub fn prefix_cache_host_capacity_bytes(&self) -> crate::error::Result<u64> {
+        self.prefix_cache_host_capacity_bytes_with_model(None)
+    }
+
+    /// Return a selected model's accepted recurrent snapshot host capacity, including alias resolution.
+    pub fn prefix_cache_host_capacity_bytes_with_model(
+        &self,
+        model_id: Option<&str>,
+    ) -> crate::error::Result<u64> {
+        self.runner
+            .prefix_cache_host_capacity_bytes(model_id)
+            .map_err(|e| SdkError::Inference(e.into()))
+    }
+
     /// Returns the maximum supported sequence length for this model, if applicable.
     pub fn max_sequence_length(&self) -> crate::error::Result<Option<usize>> {
         self.max_sequence_length_with_model(None)

@@ -16,3 +16,11 @@ docs-check:
 	cargo test -p mistralrs-server-core openapi_matches_committed
 	cargo test -p mistralrs-core supported_models_matches_committed
 	python3 docs/scripts/render_pyi.py --check
+
+.PHONY: observation-check observation-test observation-format
+observation-check:
+	cargo check -p mistralrs-core -p mistralrs-quant -p mistralrs
+observation-test:
+	cargo test -p mistralrs-core -p mistralrs-quant observation_contract --lib
+observation-format:
+	rustfmt --edition 2021 --config skip_children=true $(OBSERVATION_FILES)

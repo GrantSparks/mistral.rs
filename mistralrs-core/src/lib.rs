@@ -102,6 +102,7 @@ mod response;
 mod sampler;
 mod scheduler;
 mod sequence;
+mod serving_observation;
 mod special_text;
 pub mod speculative;
 mod speech_models;
@@ -207,6 +208,7 @@ pub use scheduler::{
 };
 pub use search::{SearchCallback, SearchFunctionParameters, SearchResult};
 use serde::Serialize;
+pub use serving_observation::inference_observations_enabled;
 pub use speculative::{
     reserve_external_mtp_memory, reserve_external_mtp_memory_with_runtime, MtpConfig,
     MtpDraftSamplingMethod, MtpRuntimeConfig, SpeculativeConfig,
@@ -2241,6 +2243,24 @@ impl MistralRs {
             Ok(engine_instance.config.max_seq_len)
         } else {
             Err(MistralRsError::EnginePoisoned)
+        }
+    }
+
+    /// Return the accepted recurrent snapshot host capacity, independent of observation mode and occupancy.
+    pub fn prefix_cache_host_capacity_bytes(&self, model_id: Option<&str>) -> Result<u64, String> {
+        let resolved_model_id = self
+            .resolve_alias_or_default(model_id)
+            .map_err(|e| e.to_string())?;
+        let engines = self
+            .engines
+            .read()
+            .map_err(|_| "Failed to acquire read lock on engines")?;
+        if let Some(engine_instance) = engines.get(&resolved_model_id) {
+            Ok(prefix_cacher::snapshot_host_capacity_bytes(
+                engine_instance.reboot_state.prefix_cache_host_bytes,
+            ) as u64)
+        } else {
+            Err(format!("Model {resolved_model_id} not found"))
         }
     }
 

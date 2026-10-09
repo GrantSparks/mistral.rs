@@ -239,7 +239,8 @@ impl MultiModelBuilder {
             scheduler_config,
             add_model_config.engine_config.throughput_logging_enabled,
             add_model_config.engine_config.search_embedding_model,
-        );
+        )
+        .with_prefix_cache_host_bytes(add_model_config.engine_config.prefix_cache_host_bytes);
         if primary_id != pipeline_name {
             runner_builder = runner_builder.with_model_id(primary_id.clone());
         }
@@ -586,7 +587,8 @@ pub async fn build_model_from_pipeline(
         scheduler_config,
         add_model_config.engine_config.throughput_logging_enabled,
         add_model_config.engine_config.search_embedding_model,
-    );
+    )
+    .with_prefix_cache_host_bytes(add_model_config.engine_config.prefix_cache_host_bytes);
 
     if let Some(cb) = add_model_config.engine_config.search_callback.clone() {
         runner_builder = runner_builder.with_search_callback(cb);

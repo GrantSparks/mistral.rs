@@ -192,6 +192,9 @@ where
         return Ok(false);
     }
 
+    for seq in seqs.iter_mut() {
+        seq.disable_exact_observation();
+    }
     let staged_state = staged_batch_state(seqs);
     match staged_state {
         StagedBatchState::Homogeneous(staged_len) => {
