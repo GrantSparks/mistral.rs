@@ -30,6 +30,7 @@ pub async fn finish_verified_step<P: Pipeline>(
     rng: Arc<std::sync::Mutex<Isaac64Rng>>,
     anchor_to_emit: Option<Logprobs>,
 ) -> Result<VerificationOutcome> {
+    seq.disable_exact_observation();
     let general_metadata = pipeline.get_metadata();
     let eos_tok = if disable_eos_stop {
         None

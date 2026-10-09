@@ -14,6 +14,62 @@ use crate::{
     UqffReader, UqffTensor,
 };
 
+const BF16_CONTEXT_MAX_INTEGER: usize = 1_000_000_000;
+const BF16_CONTEXT_MAX_ORDINAL: usize = 255;
+
+#[derive(Clone, Copy)]
+enum GemmDiagnosticBackend {
+    CublasLt,
+    Cublas,
+}
+
+fn gemm_error_context(
+    error: candle_core::Error,
+    backend: GemmDiagnosticBackend,
+    input: &Tensor,
+    weight: &Tensor,
+) -> candle_core::Error {
+    let (device, ordinal) = match input.device().location() {
+        DeviceLocation::Cpu => ("cpu", 0),
+        DeviceLocation::Cuda { gpu_id } => ("cuda", gpu_id),
+        DeviceLocation::Metal { gpu_id } => ("metal", gpu_id),
+    };
+    let (weight_device, weight_ordinal) = match weight.device().location() {
+        DeviceLocation::Cpu => ("cpu", 0),
+        DeviceLocation::Cuda { gpu_id } => ("cuda", gpu_id),
+        DeviceLocation::Metal { gpu_id } => ("metal", gpu_id),
+    };
+    if ordinal > BF16_CONTEXT_MAX_ORDINAL
+        || weight_ordinal > BF16_CONTEXT_MAX_ORDINAL
+        || [input, weight].into_iter().any(|tensor| {
+            !(1..=4).contains(&tensor.rank())
+                || tensor
+                    .dims()
+                    .iter()
+                    .chain(tensor.layout().stride())
+                    .any(|&value| value > BF16_CONTEXT_MAX_INTEGER)
+        })
+    {
+        return error;
+    }
+    let vector = |values: &[usize]| {
+        values
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let backend = match backend {
+        GemmDiagnosticBackend::CublasLt => "cublaslt",
+        GemmDiagnosticBackend::Cublas => "cublas",
+    };
+    error.context(format!(
+        "BF16_OP_CONTEXT{{kind=gemm;backend={backend};device={device};ordinal={ordinal};dtype={:?};dims={};strides={};weight_device={weight_device};weight_ordinal={weight_ordinal};weight_dtype={:?};weight_dims={};weight_strides={}}}",
+        input.dtype(), vector(input.dims()), vector(input.layout().stride()),
+        weight.dtype(), vector(weight.dims()), vector(weight.layout().stride())
+    ))
+}
+
 #[derive(Debug)]
 pub struct UnquantLinear {
     w: Tensor,
@@ -91,9 +147,11 @@ impl QuantMethod for UnquantLinear {
         // Try custom GEMV for single-token decode (batch_size=1)
         #[cfg(feature = "cuda")]
         if crate::gemv::should_use_gemv(a, &self.w) {
+            crate::serving_observation::UNQUANT_GEMV.record();
             return crate::gemv::gemv(a, &self.w, self.b.as_ref());
         }
 
+        crate::serving_observation::UNQUANT_MATMUL.record();
         let w = match *a.dims() {
             [b1, b2, _, _] => self.w.broadcast_left((b1, b2))?,
             [bsize, _, _] => self.w.broadcast_left(bsize)?,
@@ -125,10 +183,15 @@ impl QuantMethod for UnquantLinear {
                                 Some(1.0),
                                 None,
                                 None,
-                            )?
+                            )
+                            .map_err(|error| {
+                                gemm_error_context(error, GemmDiagnosticBackend::CublasLt, a, &w)
+                            })?
                             .t()
                     } else {
-                        let matmul_result = a.matmul(&w.t()?)?;
+                        let matmul_result = a.matmul(&w.t()?).map_err(|error| {
+                            gemm_error_context(error, GemmDiagnosticBackend::Cublas, a, &w)
+                        })?;
                         matmul_result.broadcast_add(&b)
                     }
                 }
@@ -165,10 +228,15 @@ impl QuantMethod for UnquantLinear {
                     };
                     if let Some(cublaslt) = cublaslt {
                         cublaslt
-                            .batch_matmul(a, &w, None, None, None, None, None)?
+                            .batch_matmul(a, &w, None, None, None, None, None)
+                            .map_err(|error| {
+                                gemm_error_context(error, GemmDiagnosticBackend::CublasLt, a, &w)
+                            })?
                             .t()
                     } else {
-                        a.matmul(&w.t()?)
+                        a.matmul(&w.t()?).map_err(|error| {
+                            gemm_error_context(error, GemmDiagnosticBackend::Cublas, a, &w)
+                        })
                     }
                 }
                 DeviceLocation::Metal { .. } => a.matmul(&w.t()?),
@@ -613,6 +681,45 @@ impl QuantizedSerde for UnquantLinear {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observation_contract_bf16_gemm_error_context_preserves_cause_and_broadcast_layout(
+    ) -> Result<()> {
+        let input = Tensor::zeros((1, 3, 2), DType::BF16, &Device::Cpu)?.transpose(1, 2)?;
+        let weight = Tensor::zeros((5, 3), DType::BF16, &Device::Cpu)?.broadcast_left(1)?;
+        let error = gemm_error_context(
+            candle_core::Error::Msg("synthetic technical cause".into()),
+            GemmDiagnosticBackend::CublasLt,
+            &input,
+            &weight,
+        );
+        let candle_core::Error::Context { inner, context } = error else {
+            panic!("expected bounded context")
+        };
+        assert_eq!(inner.to_string(), "synthetic technical cause");
+        assert_eq!(context.to_string(), "BF16_OP_CONTEXT{kind=gemm;backend=cublaslt;device=cpu;ordinal=0;dtype=BF16;dims=1,2,3;strides=6,1,2;weight_device=cpu;weight_ordinal=0;weight_dtype=BF16;weight_dims=1,5,3;weight_strides=0,3,1}");
+        Ok(())
+    }
+
+    #[test]
+    fn observation_contract_bf16_gemm_error_context_rejects_unbounded_metadata() -> Result<()> {
+        let input = Tensor::zeros((1, 2, 3), DType::BF16, &Device::Cpu)?;
+        let weights = [
+            Tensor::zeros((1, 1, 1, 1, 1), DType::BF16, &Device::Cpu)?,
+            Tensor::zeros(1, DType::BF16, &Device::Cpu)?
+                .broadcast_as(BF16_CONTEXT_MAX_INTEGER + 1)?,
+        ];
+        for weight in &weights {
+            let error = gemm_error_context(
+                candle_core::Error::Msg("original cause".into()),
+                GemmDiagnosticBackend::Cublas,
+                &input,
+                weight,
+            );
+            assert!(matches!(error, candle_core::Error::Msg(_)));
+        }
+        Ok(())
+    }
 
     fn test_layer(device: &Device) -> Result<UnquantLinear> {
         let weight = Tensor::from_vec(

@@ -639,6 +639,10 @@ pub fn build_mm_features_from_ranges_with_policy(
 }
 
 pub struct Sequence {
+    pub(crate) engine_observation: crate::EngineObservation,
+    observation_start: Option<Instant>,
+    pub(crate) observation_causal: bool,
+    observation_supported: bool,
     // Metadata, const
     id: usize,
     prompt_len: usize,
@@ -767,6 +771,7 @@ impl Sequence {
         return_raw_logits: bool,
         eos_tokens: Vec<u32>,
     ) -> Self {
+        let observation_clock = crate::serving_observation::SequenceClockAnchor::capture();
         let prompt_len = tokens.len();
         let _ = block_size; // Block management handled by KVCacheManager
         Self {
@@ -801,6 +806,40 @@ impl Sequence {
             response_index,
             creation_time,
             recognizer,
+            observation_start: observation_clock.map(|clock| clock.origin),
+            observation_causal: false,
+            observation_supported: true,
+            engine_observation: if mistralrs_quant::serving_observation::enabled() {
+                crate::EngineObservation {
+                    sequence_id: id,
+                    response_index,
+                    prompt_tokens: prompt_len,
+                    clock_origin: "sequence_creation".into(),
+                    clock_anchor_unavailable: if observation_clock
+                        .and_then(|clock| clock.utc_unix_ns)
+                        .is_some()
+                    {
+                        String::new()
+                    } else {
+                        "system_clock_out_of_range".into()
+                    },
+                    sequence_origin_utc_unix_ns: observation_clock
+                        .and_then(|clock| clock.utc_unix_ns),
+                    sequence_origin_uncertainty_ns: observation_clock
+                        .map(|clock| clock.uncertainty_ns),
+                    graph_counter_scope: "worker_process_cumulative".into(),
+                    kernel_counter_scope: "worker_process_cumulative".into(),
+                    token_count_convention: "accepted_causal_output_including_eos_stop_nonvisible"
+                        .into(),
+                    token_marker_boundary: "accepted_sampler_result_before_token_decode".into(),
+                    kernel_phase_unavailable:
+                        "process_phase_counters_include_warmup_capture_no_request_attribution"
+                            .into(),
+                    ..Default::default()
+                }
+            } else {
+                Default::default()
+            },
             prefill_prompt_toks: None,
             prefix_cache_len: 0,
             block_hash_revision: 0,
@@ -1084,6 +1123,15 @@ impl Sequence {
                 );
             }
         }
+        if self.observation_start.is_some() {
+            self.engine_observation.prompt_tokens = self.prompt_len;
+            self.engine_observation
+                .final_prefix(self.prompt_len, self.prefix_cache_len);
+            if self.engine_observation.prefill_chunk_count == Some(1) {
+                self.engine_observation.prefill_chunk_max_tokens =
+                    Some(self.prompt_len.saturating_sub(self.prefix_cache_len));
+            }
+        }
     }
 
     pub fn completion_bytes(&self) -> &[u8] {
@@ -1216,6 +1264,44 @@ impl Sequence {
         self.tokens.push(tok.token);
         self.logprobs.push(tok);
         self.reset_prefill_toks();
+    }
+
+    pub(crate) fn disable_exact_observation(&mut self) {
+        if !self.observation_supported {
+            return;
+        }
+        self.observation_supported = false;
+        if self.observation_start.is_some() {
+            get_mut_group!(self).engine_observation = None;
+        }
+    }
+
+    pub(crate) fn snapshot_observation_mut(&mut self) -> Option<&mut crate::EngineObservation> {
+        if self.observation_start.is_none()
+            || !self.observation_supported
+            || !get_mut_group!(self).observation_single_choice
+        {
+            return None;
+        }
+        Some(&mut self.engine_observation)
+    }
+
+    pub(crate) fn observe_sampled_token(&mut self) {
+        if let Some(start) = self
+            .observation_start
+            .filter(|_| self.observation_supported)
+        {
+            self.engine_observation
+                .accepted_token(u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX));
+        }
+    }
+
+    pub(crate) fn mark_final_token(&mut self, reason: &StopReason) {
+        if self.observation_start.is_none() || !self.observation_supported {
+            return;
+        }
+        self.engine_observation.finish_reason = Some(reason.to_string());
+        self.engine_observation.final_token_marker = self.engine_observation.sampled_tokens > 0;
     }
 
     pub fn responder(&self) -> Sender<Response> {
@@ -1361,6 +1447,10 @@ impl Sequence {
             .unwrap_or(0)
             .saturating_add(prompt_ms);
         self.total_prompt_time = Some(total);
+        if self.observation_start.is_some() {
+            self.engine_observation.raw_prompt_sec +=
+                duration.as_secs_f64() - denoise_ms as f64 / 1000.0;
+        }
         if denoise_ms > 0 {
             self.total_completion_time = Some(
                 self.total_completion_time
@@ -1386,6 +1476,9 @@ impl Sequence {
             .unwrap_or(0)
             .saturating_add(duration.as_millis());
         self.total_completion_time = Some(total);
+        if self.observation_start.is_some() {
+            self.engine_observation.raw_completion_sec += duration.as_secs_f64();
+        }
         self.step_start_instant = None;
         self.step_timing_kind = None;
         self.update_time_info();
@@ -1407,6 +1500,25 @@ impl Sequence {
         }
 
         let mut group = get_mut_group!(self);
+        if group.observation_single_choice
+            && self.observation_causal
+            && self.observation_supported
+            && self.observation_start.is_some()
+        {
+            let mut observation = self.engine_observation.clone();
+            observation.prompt_tokens = self.prompt_len;
+            if let (Some(start), Some(kind)) = (self.step_start_instant, self.step_timing_kind) {
+                match kind {
+                    StepTimingKind::Prompt => {
+                        observation.raw_prompt_sec += start.elapsed().as_secs_f64()
+                    }
+                    StepTimingKind::Completion => {
+                        observation.raw_completion_sec += start.elapsed().as_secs_f64()
+                    }
+                }
+            }
+            group.engine_observation = Some(observation);
+        }
         group.total_prompt_time = prompt_time_ms;
         group.total_completion_time = completion_time_ms;
         group.total_time = prompt_time_ms.saturating_add(completion_time_ms);
@@ -1720,6 +1832,8 @@ impl Sequence {
 }
 
 pub struct SequenceGroup {
+    observation_single_choice: bool,
+    engine_observation: Option<crate::EngineObservation>,
     n_choices: usize, // The target number of choices to return. Can be decreased if an error is thrown.
     best_of: Option<usize>, // Top n seqs based on cumulative logprobs.
     pub total_prompt_toks: usize,
@@ -1747,6 +1861,8 @@ impl SequenceGroup {
         best_of: Option<usize>,
     ) -> Self {
         Self {
+            engine_observation: None,
+            observation_single_choice: n_choices == 1,
             choices: Vec::new(),
             image_choices: Vec::new(),
             speech_pcms: Vec::new(),
@@ -1798,6 +1914,7 @@ impl SequenceGroup {
     pub fn get_usage(&self) -> Usage {
         #[allow(clippy::cast_precision_loss)]
         Usage {
+            engine_observation: self.engine_observation.clone(),
             completion_tokens: self.total_toks.saturating_sub(self.total_prompt_toks),
             prompt_tokens: self.total_prompt_toks,
             total_tokens: self.total_toks,
@@ -1971,6 +2088,10 @@ mod tests {
     use tokio::sync::mpsc::channel;
 
     fn make_test_sequence() -> Sequence {
+        make_test_sequence_with_layers(0)
+    }
+
+    fn make_test_sequence_with_layers(layers: usize) -> Sequence {
         let (tx, _rx) = channel(1);
         let sampler = Sampler::new(
             None,
@@ -1994,7 +2115,7 @@ mod tests {
             "prompt".to_string(),
             0,
             0,
-            0,
+            layers,
             tx,
             sampler,
             vec![],
@@ -2021,6 +2142,120 @@ mod tests {
             false,
             vec![],
         )
+    }
+
+    #[test]
+    fn observation_contract_snapshot_unobserved_origin_stays_unknown() {
+        let mut seq = make_test_sequence_with_layers(1);
+        assert!(seq.snapshot_observation_mut().is_some());
+        seq.observation_start = None;
+        assert!(seq.snapshot_observation_mut().is_none());
+        assert_eq!(seq.engine_observation.snapshot_write_count, None);
+        assert_eq!(
+            seq.engine_observation.snapshot_write_measurement_complete,
+            None
+        );
+    }
+
+    #[test]
+    fn observation_contract_original_multichoice_remains_unavailable_after_error() {
+        let mut seq = make_test_sequence_with_layers(1);
+        seq.group = Arc::new(Mutex::new(SequenceGroup::new(2, false, true, None)));
+        seq.observation_causal = true;
+        seq.observe_sampled_token();
+        seq.set_state(SequenceState::Error);
+        assert!(seq.snapshot_observation_mut().is_none());
+        seq.update_time_info();
+        let group = seq.get_mut_group();
+        assert_eq!(group.n_choices, 1);
+        assert!(group.get_usage().engine_observation.is_none());
+    }
+
+    #[test]
+    fn observation_contract_length_terminal_keeps_marker_and_stop_reason() {
+        let mut seq = make_test_sequence_with_layers(1);
+        seq.observation_causal = true;
+        for token in [9, 10] {
+            seq.observe_sampled_token();
+            let reason = (token == 10).then_some(StopReason::Length(2));
+            seq.add_token(
+                Logprobs {
+                    token,
+                    logprob: 0.0,
+                    bytes: None,
+                    top_logprobs: None,
+                },
+                vec![b'x'],
+                &reason,
+            );
+        }
+        seq.set_state(SequenceState::Done(StopReason::Length(2)));
+        seq.mark_final_token(&StopReason::Length(2));
+        seq.update_time_info();
+        let usage = seq.get_mut_group().get_usage();
+        assert_eq!(usage.completion_tokens, 2);
+        let observation = usage.engine_observation.expect("single causal observation");
+        assert_eq!(observation.finish_reason.as_deref(), Some("length"));
+        assert_eq!(observation.sampled_tokens, 2);
+        assert!(observation.final_token_marker);
+        assert!(
+            observation.first_token_sequence_elapsed_ns
+                <= observation.last_token_sequence_elapsed_ns
+        );
+        assert!(observation.sequence_origin_utc_unix_ns.is_some());
+        assert!(observation.sequence_origin_uncertainty_ns.is_some());
+    }
+
+    #[test]
+    fn observation_contract_speculative_entry_permanently_clears_prior_usage() {
+        let mut seq = make_test_sequence_with_layers(1);
+        seq.observation_causal = true;
+        seq.observe_sampled_token();
+        seq.update_time_info();
+        assert!(seq.get_mut_group().get_usage().engine_observation.is_some());
+        seq.disable_exact_observation();
+        assert!(seq.snapshot_observation_mut().is_none());
+        assert!(seq.get_mut_group().get_usage().engine_observation.is_none());
+        seq.observation_causal = true;
+        seq.observe_sampled_token();
+        seq.mark_final_token(&StopReason::Eos);
+        seq.update_time_info();
+        assert!(seq.get_mut_group().get_usage().engine_observation.is_none());
+        assert_eq!(seq.engine_observation.sampled_tokens, 1);
+    }
+
+    #[test]
+    fn observation_contract_terminal_stop_tokens_count_without_visible_bytes() {
+        for reason in [StopReason::Eos, StopReason::StopTok(9)] {
+            let mut seq = make_test_sequence_with_layers(1);
+            seq.observation_causal = true;
+            seq.observe_sampled_token();
+            seq.add_token(
+                Logprobs {
+                    token: 9,
+                    logprob: 0.0,
+                    bytes: None,
+                    top_logprobs: None,
+                },
+                vec![b'x'],
+                &Some(reason),
+            );
+            seq.set_state(SequenceState::Done(reason));
+            seq.mark_final_token(&reason);
+            seq.update_time_info();
+            assert!(seq.completion_bytes().is_empty());
+            let usage = seq.get_mut_group().get_usage();
+            assert_eq!(usage.completion_tokens, 1);
+            let observation = usage
+                .engine_observation
+                .expect("single causal terminal observation");
+            assert_eq!(observation.sampled_tokens, 1);
+            assert!(observation.final_token_marker);
+            assert_eq!(
+                observation.first_token_sequence_elapsed_ns,
+                observation.last_token_sequence_elapsed_ns
+            );
+        }
     }
 
     fn weather_tool() -> Tool {

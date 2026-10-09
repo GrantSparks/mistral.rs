@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use candle_core::{DType, Device, Module, Result, Tensor, D};
+use candle_core::{DType, Device, DeviceLocation, Module, Result, Tensor, D};
 use candle_nn::Embedding;
 use mistralrs_quant::{
     ColumnParallelLayer, QuantMethod, QuantizedConfig, ReplicatedLayer, RowParallelLayer,
@@ -29,6 +29,82 @@ use crate::{
     },
     utils::{progress::NiceProgressBar, unvarbuilder::UnVarBuilder},
 };
+
+const BF16_CONTEXT_MAX_INTEGER: usize = 1_000_000_000;
+const BF16_CONTEXT_MAX_LAYER: usize = 4095;
+const BF16_CONTEXT_MAX_ORDINAL: usize = 255;
+
+#[derive(Clone, Copy)]
+enum Bf16ForwardStage {
+    AttentionQkv,
+    AttentionSdpa,
+    AttentionOutput,
+    Gdn,
+    MlpGate,
+    MlpUp,
+    MlpDown,
+    FullAttentionLayer,
+    LinearAttentionLayer,
+    LmHead,
+}
+
+impl Bf16ForwardStage {
+    fn name(self) -> &'static str {
+        match self {
+            Self::AttentionQkv => "attention_qkv",
+            Self::AttentionSdpa => "attention_sdpa",
+            Self::AttentionOutput => "attention_output",
+            Self::Gdn => "gdn",
+            Self::MlpGate => "mlp_gate",
+            Self::MlpUp => "mlp_up",
+            Self::MlpDown => "mlp_down",
+            Self::FullAttentionLayer => "full_attention_layer",
+            Self::LinearAttentionLayer => "linear_attention_layer",
+            Self::LmHead => "lm_head",
+        }
+    }
+}
+
+fn forward_error_context(
+    error: candle_core::Error,
+    layer: usize,
+    stage: Bf16ForwardStage,
+    input: &Tensor,
+) -> candle_core::Error {
+    let (device, ordinal) = match input.device().location() {
+        DeviceLocation::Cpu => ("cpu", 0),
+        DeviceLocation::Cuda { gpu_id } => ("cuda", gpu_id),
+        DeviceLocation::Metal { gpu_id } => ("metal", gpu_id),
+    };
+    if layer > BF16_CONTEXT_MAX_LAYER
+        || ordinal > BF16_CONTEXT_MAX_ORDINAL
+        || !(1..=4).contains(&input.rank())
+        || input
+            .dims()
+            .iter()
+            .chain(input.layout().stride())
+            .any(|&value| value > BF16_CONTEXT_MAX_INTEGER)
+    {
+        return error;
+    }
+    let dims = input
+        .dims()
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let strides = input
+        .layout()
+        .stride()
+        .iter()
+        .map(usize::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    error.context(format!(
+        "BF16_OP_CONTEXT{{kind=layer;layer={layer};stage={};device={device};ordinal={ordinal};dtype={:?};dims={dims};strides={strides}}}",
+        stage.name(), input.dtype()
+    ))
+}
 
 impl GdnConfig for TextConfig {
     fn hidden_size(&self) -> usize {
@@ -158,6 +234,7 @@ impl FullAttention {
     #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
+        layer_idx: usize,
         x: &Tensor,
         attention_mask: &AttentionMask,
         cos_sin: &(Tensor, Tensor),
@@ -167,7 +244,9 @@ impl FullAttention {
     ) -> Result<Tensor> {
         let (b_sz, seq_len, _) = x.dims3()?;
         let (q_gate, k, v) =
-            crate::ops::qkv_projections(x, &*self.q_proj, &*self.k_proj, &*self.v_proj)?;
+            crate::ops::qkv_projections(x, &*self.q_proj, &*self.k_proj, &*self.v_proj).map_err(
+                |error| forward_error_context(error, layer_idx, Bf16ForwardStage::AttentionQkv, x),
+            )?;
         // Split q_gate into q and gate
         let q_gate = q_gate.reshape((b_sz, seq_len, self.num_heads, self.head_dim * 2))?;
         let q = q_gate.narrow(D::Minus1, 0, self.head_dim)?;
@@ -204,31 +283,44 @@ impl FullAttention {
         // Standard attention
         let mut y = match &self.paged_attn {
             Some(paged_attn) => match metadata {
-                Some(((key_cache, value_cache), input_metadata)) => paged_attn.forward(
-                    &q,
-                    &k,
-                    &v,
-                    attention_mask,
-                    Some(key_cache),
-                    Some(value_cache),
-                    input_metadata,
-                    &self.sdpa_params,
-                    Some(flash_params),
-                )?,
-                None => {
-                    let input_metadata = PagedAttentionInputMetadata::dummy(q.device())?;
-                    assert!(!matches!(attention_mask, AttentionMask::None));
-                    paged_attn.forward(
+                Some(((key_cache, value_cache), input_metadata)) => paged_attn
+                    .forward(
                         &q,
                         &k,
                         &v,
                         attention_mask,
-                        None,
-                        None,
-                        &input_metadata,
+                        Some(key_cache),
+                        Some(value_cache),
+                        input_metadata,
                         &self.sdpa_params,
                         Some(flash_params),
-                    )?
+                    )
+                    .map_err(|error| {
+                        forward_error_context(error, layer_idx, Bf16ForwardStage::AttentionSdpa, &q)
+                    })?,
+                None => {
+                    let input_metadata = PagedAttentionInputMetadata::dummy(q.device())?;
+                    assert!(!matches!(attention_mask, AttentionMask::None));
+                    paged_attn
+                        .forward(
+                            &q,
+                            &k,
+                            &v,
+                            attention_mask,
+                            None,
+                            None,
+                            &input_metadata,
+                            &self.sdpa_params,
+                            Some(flash_params),
+                        )
+                        .map_err(|error| {
+                            forward_error_context(
+                                error,
+                                layer_idx,
+                                Bf16ForwardStage::AttentionSdpa,
+                                &q,
+                            )
+                        })?
                 }
             },
             None => {
@@ -240,7 +332,10 @@ impl FullAttention {
                     attention_mask,
                     Some(flash_params),
                     &self.sdpa_params,
-                )?
+                )
+                .map_err(|error| {
+                    forward_error_context(error, layer_idx, Bf16ForwardStage::AttentionSdpa, &q)
+                })?
             }
         };
 
@@ -258,7 +353,9 @@ impl FullAttention {
         let gate = candle_nn::ops::sigmoid(&gate.to_dtype(y.dtype())?)?;
         y = y.broadcast_mul(&gate)?;
 
-        let res = self.o_proj.forward(&y)?;
+        let res = self.o_proj.forward(&y).map_err(|error| {
+            forward_error_context(error, layer_idx, Bf16ForwardStage::AttentionOutput, &y)
+        })?;
         Ok(res)
     }
 }
@@ -314,11 +411,17 @@ impl Mlp {
         })
     }
 
-    fn forward(&self, xs: &Tensor) -> Result<Tensor> {
-        let gate = self.gate_proj.forward(xs)?;
-        let up = self.up_proj.forward(xs)?;
+    fn forward(&self, layer_idx: usize, xs: &Tensor) -> Result<Tensor> {
+        let gate = self.gate_proj.forward(xs).map_err(|error| {
+            forward_error_context(error, layer_idx, Bf16ForwardStage::MlpGate, xs)
+        })?;
+        let up = self.up_proj.forward(xs).map_err(|error| {
+            forward_error_context(error, layer_idx, Bf16ForwardStage::MlpUp, xs)
+        })?;
         let activated = crate::ops::mul_and_act(&gate, &up, self.act_fn)?;
-        let res = self.down_proj.forward(&activated)?;
+        let res = self.down_proj.forward(&activated).map_err(|error| {
+            forward_error_context(error, layer_idx, Bf16ForwardStage::MlpDown, &activated)
+        })?;
         Ok(res)
     }
 }
@@ -341,6 +444,7 @@ impl DecoderLayer {
     #[allow(clippy::too_many_arguments)]
     fn forward_attention(
         &self,
+        layer_idx: usize,
         x: &Tensor,
         attention_mask: &AttentionMask,
         cos_sin: &(Tensor, Tensor),
@@ -355,6 +459,7 @@ impl DecoderLayer {
         let residual = x;
         let x = self.input_layernorm.forward(x)?;
         let attn_out = attn.forward(
+            layer_idx,
             &x,
             attention_mask,
             cos_sin,
@@ -365,12 +470,13 @@ impl DecoderLayer {
         let x = (attn_out + residual)?;
         let residual = &x;
         let normed = self.post_attention_layernorm.forward(&x)?;
-        let ffn_out = self.mlp.forward(&normed)?;
+        let ffn_out = self.mlp.forward(layer_idx, &normed)?;
         ffn_out + residual
     }
 
     fn forward_linear(
         &self,
+        layer_idx: usize,
         x: &Tensor,
         cache: &mut GdnLayerCache,
         batch_kind: RecurrentBatchKind,
@@ -381,11 +487,13 @@ impl DecoderLayer {
         };
         let residual = x;
         let x = self.input_layernorm.forward(x)?;
-        let gdn_out = gdn.forward(&x, cache, batch_kind)?;
+        let gdn_out = gdn
+            .forward(&x, cache, batch_kind)
+            .map_err(|error| forward_error_context(error, layer_idx, Bf16ForwardStage::Gdn, &x))?;
         let x = (gdn_out + residual)?;
         let residual = &x;
         let normed = self.post_attention_layernorm.forward(&x)?;
-        let ffn_out = self.mlp.forward(&normed)?;
+        let ffn_out = self.mlp.forward(layer_idx, &normed)?;
         ffn_out + residual
     }
 }
@@ -404,6 +512,37 @@ pub struct Qwen3_5TextModel {
     pub(super) device: Device,
     pub(super) dtype: DType,
     pub(super) max_seq_len: usize,
+}
+
+fn tensor_for_layer<'a>(
+    tensors: &'a mut HashMap<DeviceLocation, Tensor>,
+    tensor: &Tensor,
+    mapper: &dyn DeviceMapper,
+    layer_idx: usize,
+    device: &Device,
+) -> Result<&'a Tensor> {
+    match tensors.entry(device.location()) {
+        std::collections::hash_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            Ok(entry.insert(mapper.map(tensor.clone(), layer_idx)?))
+        }
+    }
+}
+
+fn rotary_for_layer<'a>(
+    tensors: &'a mut HashMap<DeviceLocation, (Tensor, Tensor)>,
+    cos_sin: &(Tensor, Tensor),
+    mapper: &dyn DeviceMapper,
+    layer_idx: usize,
+    device: &Device,
+) -> Result<&'a (Tensor, Tensor)> {
+    match tensors.entry(device.location()) {
+        std::collections::hash_map::Entry::Occupied(entry) => Ok(entry.into_mut()),
+        std::collections::hash_map::Entry::Vacant(entry) => Ok(entry.insert((
+            mapper.map(cos_sin.0.clone(), layer_idx)?,
+            mapper.map(cos_sin.1.clone(), layer_idx)?,
+        ))),
+    }
 }
 
 impl Qwen3_5TextModel {
@@ -586,11 +725,11 @@ impl Qwen3_5TextModel {
         };
 
         let pipeline_cache = Arc::new(Mutex::new(
-            HybridCache::new(
-                hybrid_cache_config,
-                vb_m.dtype(),
-                &normal_loading_metadata.real_device,
-            )
+            HybridCache::new_with_layer_devices(hybrid_cache_config, vb_m.dtype(), |layer_idx| {
+                mapper
+                    .device_for(layer_idx, false)
+                    .unwrap_or(&normal_loading_metadata.real_device)
+            })
             .map_err(|e| {
                 candle_core::Error::Msg(format!("Failed to create hybrid cache: {}", e))
             })?,
@@ -624,6 +763,15 @@ impl Qwen3_5TextModel {
 
     pub fn embed_tokens(&self, input_ids: &Tensor) -> Result<Tensor> {
         self.embed_tokens.forward(input_ids)
+    }
+
+    #[cfg(feature = "cuda")]
+    pub(super) fn supports_cuda_decode_graphs(&self) -> bool {
+        // Capture tracks only the input device's stream; staged layer transfers need eager execution.
+        self.mapper
+            .get_unique_devices()
+            .iter()
+            .all(|device| device.same_device(&self.device))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -693,20 +841,39 @@ impl Qwen3_5TextModel {
             None
         };
 
+        let mut rotary_by_device = HashMap::new();
+        let mut indices_by_device = HashMap::new();
         for (i, layer) in self.layers.iter().enumerate() {
             xs = self.mapper.map(xs, i)?;
 
             match &self.layer_types[i] {
                 LayerType::FullAttention => {
                     if let Some(HybridLayerCache::Attention(kv_cache)) = hybrid_cache.get_mut(i) {
-                        xs = layer.forward_attention(
-                            &xs,
-                            &attention_mask.get(xs.device()),
+                        let cos_sin = rotary_for_layer(
+                            &mut rotary_by_device,
                             &cos_sin,
-                            kv_cache,
-                            ctx.paged_layer(i),
-                            ctx.flash_params(),
+                            &*self.mapper,
+                            i,
+                            xs.device(),
                         )?;
+                        xs = layer
+                            .forward_attention(
+                                i,
+                                &xs,
+                                &attention_mask.get(xs.device()),
+                                cos_sin,
+                                kv_cache,
+                                ctx.paged_layer(i),
+                                ctx.flash_params(),
+                            )
+                            .map_err(|error| {
+                                forward_error_context(
+                                    error,
+                                    i,
+                                    Bf16ForwardStage::FullAttentionLayer,
+                                    &xs,
+                                )
+                            })?;
                     }
                 }
                 LayerType::LinearAttention => {
@@ -714,7 +881,13 @@ impl Qwen3_5TextModel {
                         let recurrent_metadata = recurrent_metadata.as_ref().expect(
                             "checked above: linear-attention layers require recurrent metadata",
                         );
-                        let indices = recurrent_metadata.state_indices();
+                        let indices = tensor_for_layer(
+                            &mut indices_by_device,
+                            recurrent_metadata.state_indices(),
+                            &*self.mapper,
+                            i,
+                            pool.device(),
+                        )?;
 
                         let conv_state = pool.gather_conv_state(indices)?;
                         let recurrent_state = pool.gather_recurrent_state(indices)?;
@@ -724,11 +897,16 @@ impl Qwen3_5TextModel {
                             recurrent_state,
                         };
 
-                        xs = layer.forward_linear(
-                            &xs,
-                            &mut gdn_cache,
-                            recurrent_metadata.batch_kind(),
-                        )?;
+                        xs = layer
+                            .forward_linear(i, &xs, &mut gdn_cache, recurrent_metadata.batch_kind())
+                            .map_err(|error| {
+                                forward_error_context(
+                                    error,
+                                    i,
+                                    Bf16ForwardStage::LinearAttentionLayer,
+                                    &xs,
+                                )
+                            })?;
 
                         pool.scatter_conv_state_with_host_indices(
                             indices,
@@ -757,10 +935,17 @@ impl Qwen3_5TextModel {
                 }
             }
         }
-        let xs = xs.to_device(&self.device)?;
+        let xs = self.mapper.cast_nm_device(&xs, false)?;
         let xs = xs.apply(&self.norm)?;
         let xs = ctx.logits(&xs)?;
-        self.lm_head.forward(&xs)
+        self.lm_head.forward(&xs).map_err(|error| {
+            forward_error_context(
+                error,
+                self.layers.len().saturating_sub(1),
+                Bf16ForwardStage::LmHead,
+                &xs,
+            )
+        })
     }
 
     fn deepstack_process(
@@ -788,6 +973,443 @@ impl Qwen3_5TextModel {
 
         let result = hidden_flat.scatter_add(idx_expanded, &visual_embeds, 0)?;
         result.reshape((batch, seq, hidden))
+    }
+}
+
+#[cfg(test)]
+mod bf16_layer_device_tests {
+    use super::*;
+    use crate::device_map::DeviceMapSetting;
+
+    #[test]
+    fn observation_contract_bf16_layer_error_context_preserves_cause_and_layout() -> Result<()> {
+        let input = Tensor::zeros((1, 3, 2), DType::BF16, &Device::Cpu)?.transpose(1, 2)?;
+        let error = forward_error_context(
+            candle_core::Error::Msg("synthetic technical cause".into()),
+            32,
+            Bf16ForwardStage::MlpGate,
+            &input,
+        );
+        let candle_core::Error::Context { inner, context } = error else {
+            panic!("expected bounded context")
+        };
+        assert_eq!(inner.to_string(), "synthetic technical cause");
+        assert_eq!(context.to_string(), "BF16_OP_CONTEXT{kind=layer;layer=32;stage=mlp_gate;device=cpu;ordinal=0;dtype=BF16;dims=1,2,3;strides=6,1,2}");
+        Ok(())
+    }
+
+    #[test]
+    fn observation_contract_bf16_layer_error_context_rejects_unbounded_metadata() -> Result<()> {
+        let inputs = [
+            Tensor::zeros((1, 1, 1, 1, 1), DType::BF16, &Device::Cpu)?,
+            Tensor::zeros(1, DType::BF16, &Device::Cpu)?
+                .broadcast_as(BF16_CONTEXT_MAX_INTEGER + 1)?,
+        ];
+        for input in &inputs {
+            let error = forward_error_context(
+                candle_core::Error::Msg("original cause".into()),
+                0,
+                Bf16ForwardStage::Gdn,
+                input,
+            );
+            assert!(matches!(error, candle_core::Error::Msg(_)));
+        }
+        let error = forward_error_context(
+            candle_core::Error::Msg("original cause".into()),
+            BF16_CONTEXT_MAX_LAYER + 1,
+            Bf16ForwardStage::Gdn,
+            &Tensor::zeros(1, DType::BF16, &Device::Cpu)?,
+        );
+        assert!(matches!(error, candle_core::Error::Msg(_)));
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    const DENSE_PROBE_K: usize = 5120;
+    #[cfg(feature = "cuda")]
+    const DENSE_PROBE_N: usize = 10240;
+
+    #[cfg(feature = "cuda")]
+    #[derive(Clone, Copy)]
+    enum DenseProbeBackend {
+        Production,
+        Candle,
+        LtWrongInit,
+        LtBoundInit,
+    }
+
+    #[cfg(feature = "cuda")]
+    struct DenseProbe {
+        backend: DenseProbeBackend,
+        backend_name: &'static str,
+        m: usize,
+        ordinal: usize,
+    }
+
+    #[cfg(feature = "cuda")]
+    impl DenseProbe {
+        fn from_env() -> Result<Option<Self>> {
+            let backend = std::env::var("BF16_DENSE_PROBE_BACKEND");
+            let m = std::env::var("BF16_DENSE_PROBE_M");
+            let ordinal = std::env::var("BF16_DENSE_PROBE_DEVICE");
+            if matches!(&backend, Err(std::env::VarError::NotPresent))
+                && matches!(&m, Err(std::env::VarError::NotPresent))
+                && matches!(&ordinal, Err(std::env::VarError::NotPresent))
+            {
+                return Ok(None);
+            }
+            let (backend, backend_name) = match backend.as_deref() {
+                Ok("production") => (DenseProbeBackend::Production, "production"),
+                Ok("candle") => (DenseProbeBackend::Candle, "candle"),
+                Ok("lt_wrong_init") => (DenseProbeBackend::LtWrongInit, "lt_wrong_init"),
+                Ok("lt_bound_init") => (DenseProbeBackend::LtBoundInit, "lt_bound_init"),
+                _ => candle_core::bail!("Select a supported BF16_DENSE_PROBE_BACKEND"),
+            };
+            let m = match m.as_deref() {
+                Ok("1") => 1,
+                Ok("9") => 9,
+                Ok("9586") => 9586,
+                _ => candle_core::bail!("Select BF16_DENSE_PROBE_M from 1, 9, 9586"),
+            };
+            let ordinal = match ordinal.as_deref() {
+                Ok("0") => 0,
+                Ok("1") => 1,
+                _ => candle_core::bail!("Select BF16_DENSE_PROBE_DEVICE from 0, 1"),
+            };
+            Ok(Some(Self {
+                backend,
+                backend_name,
+                m,
+                ordinal,
+            }))
+        }
+
+        fn record(&self, stage: &'static str, route: &'static str, current: usize) {
+            eprintln!(
+                "BF16_DENSE_PROBE backend={} route={} stage={} device={} current_before={} m={} n={} k={} dtype=BF16",
+                self.backend_name, route, stage, self.ordinal, current, self.m, DENSE_PROBE_N, DENSE_PROBE_K
+            );
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    fn bind_probe_device(device: &Device) -> Result<()> {
+        let Device::Cuda(device) = device else {
+            candle_core::bail!("Dense probe requires CUDA")
+        };
+        device
+            .cuda_stream()
+            .context()
+            .bind_to_thread()
+            .map_err(candle_core::Error::wrap)
+    }
+
+    #[cfg(feature = "cuda")]
+    fn assert_probe_current(device: &Device) -> Result<()> {
+        use candle_core::cuda::cudarc::driver::result::ctx;
+        let Device::Cuda(device) = device else {
+            candle_core::bail!("Dense probe requires CUDA")
+        };
+        let current = ctx::get_current().map_err(candle_core::Error::wrap)?;
+        assert_eq!(current, Some(device.cuda_stream().context().cu_ctx()));
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires two CUDA devices and one selected case per fresh process"]
+    fn bf16_layer_device_two_gpu_dense_probe() -> Result<()> {
+        use mistralrs_quant::{
+            cublaslt::{
+                fused_batch_matmul, maybe_init_cublas_lt_wrapper, CublasLt, CUBLASLT_CONTROLLER,
+            },
+            QuantMethodConfig, UnquantLinear,
+        };
+        let Some(probe) = DenseProbe::from_env()? else {
+            eprintln!("BF16_DENSE_PROBE stage=not_selected");
+            return Ok(());
+        };
+        // A failing CUDA call ends this test process; controls run in separate invocations.
+        let devices = [Device::new_cuda(0)?, Device::new_cuda(1)?];
+        let device = &devices[probe.ordinal];
+        let opposite = 1 - probe.ordinal;
+        let input = Tensor::ones((1, probe.m, DENSE_PROBE_K), DType::BF16, device)?;
+        let weight = Tensor::ones((DENSE_PROBE_N, DENSE_PROBE_K), DType::BF16, device)?;
+        let weight_batch = weight.broadcast_left(1)?;
+        let linear = UnquantLinear::new(QuantMethodConfig::Unquantized(candle_nn::Linear::new(
+            weight, None,
+        )))?;
+
+        let (local_handle, route) = match probe.backend {
+            DenseProbeBackend::Production => {
+                bind_probe_device(&devices[0])?;
+                assert_probe_current(&devices[0])?;
+                maybe_init_cublas_lt_wrapper(devices[0].clone());
+                assert!(CUBLASLT_CONTROLLER.get_for_device(&devices[0]).is_some());
+                assert!(CUBLASLT_CONTROLLER.get_for_device(&devices[1]).is_none());
+                let route =
+                    if mistralrs_quant::gemv::should_use_gemv(&input, &weight_batch.squeeze(0)?) {
+                        "gemv"
+                    } else if probe.ordinal == 0 {
+                        "cublaslt"
+                    } else {
+                        "cublas"
+                    };
+                (None, route)
+            }
+            DenseProbeBackend::Candle => (None, "cublas"),
+            DenseProbeBackend::LtWrongInit | DenseProbeBackend::LtBoundInit => {
+                let current = match probe.backend {
+                    DenseProbeBackend::LtWrongInit => opposite,
+                    _ => probe.ordinal,
+                };
+                bind_probe_device(&devices[current])?;
+                assert_probe_current(&devices[current])?;
+                probe.record("initialize", "cublaslt", current);
+                // The one-case process owns cleanup; Drop could mask an asynchronous CUDA error.
+                (
+                    Some(std::mem::ManuallyDrop::new(CublasLt::new(device)?)),
+                    "cublaslt",
+                )
+            }
+        };
+
+        let opposite_allocation = Tensor::ones(1, DType::BF16, &devices[opposite])?;
+        assert_probe_current(&devices[opposite])?;
+        probe.record("forward", route, opposite);
+        let output = match probe.backend {
+            DenseProbeBackend::Production => linear.forward(&input),
+            DenseProbeBackend::Candle => input.matmul(&weight_batch.t()?),
+            DenseProbeBackend::LtWrongInit | DenseProbeBackend::LtBoundInit => {
+                let handle: &CublasLt = local_handle.as_ref().expect("local handle case");
+                fused_batch_matmul(
+                    &input,
+                    &weight_batch,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    handle.clone(),
+                )
+                .and_then(|output| output.t())
+            }
+        };
+        let output = match output {
+            Ok(output) => output,
+            Err(error) => {
+                probe.record("forward_error", route, opposite);
+                return Err(error);
+            }
+        };
+        device.synchronize()?;
+        assert_eq!(output.dims(), &[1, probe.m, DENSE_PROBE_N]);
+        assert_eq!(output.dtype(), DType::BF16);
+        assert!(output.device().same_device(device));
+        // The exact all-ones dot product is representable in BF16 and rejects NaNs as well.
+        assert_eq!(
+            output
+                .eq(DENSE_PROBE_K as f64)?
+                .min_all()?
+                .to_scalar::<u8>()?,
+            1
+        );
+        device.synchronize()?;
+        assert_eq!(opposite_allocation.to_vec1::<half::bf16>()?.len(), 1);
+        probe.record("validated", route, opposite);
+        Ok(())
+    }
+
+    #[test]
+    fn bf16_layer_device_mapping_reuses_single_device_buffers() -> Result<()> {
+        let device = Device::Cpu;
+        let mapper = DeviceMapSetting::dummy().into_mapper(3, &device, None, &[])?;
+        let indices = Tensor::from_vec(vec![2u32, 0], 2, &device)?;
+        let mut mapped = HashMap::new();
+        let first = tensor_for_layer(&mut mapped, &indices, &*mapper, 0, &device)?.id();
+        let second = tensor_for_layer(&mut mapped, &indices, &*mapper, 2, &device)?.id();
+        assert_eq!(first, second);
+        assert_eq!(mapped.len(), 1);
+        let pair = (
+            Tensor::from_vec(vec![1f32, 2.], (1, 1, 2), &device)?,
+            Tensor::from_vec(vec![3f32, 4.], (1, 1, 2), &device)?,
+        );
+        let mut rotary = HashMap::new();
+        let first = rotary_for_layer(&mut rotary, &pair, &*mapper, 0, &device)?
+            .0
+            .id();
+        let second = rotary_for_layer(&mut rotary, &pair, &*mapper, 2, &device)?
+            .0
+            .id();
+        assert_eq!(first, second);
+        assert_eq!(rotary.len(), 1);
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    fn flat(tensor: &Tensor) -> Result<Vec<f32>> {
+        tensor
+            .to_dtype(DType::F32)?
+            .to_device(&Device::Cpu)?
+            .flatten_all()?
+            .to_vec1()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn patterned(len: usize, salt: usize) -> Vec<f32> {
+        (0..len)
+            .map(|i| (u16::try_from((i + salt) % 31).expect("small pattern") as f32 - 15.) / 100.)
+            .collect()
+    }
+
+    #[cfg(feature = "cuda")]
+    fn run_gdn_pool(
+        conv_state: Tensor,
+        recurrent_state: Tensor,
+    ) -> Result<(Vec<f32>, Tensor, Tensor)> {
+        use crate::cuda::gdn::{
+            causal_conv1d_cuda, fused_decode_recurrence_cuda, prepare_recurrence_inputs_cuda,
+            warp_gated_delta_rule_recurrence_cuda,
+        };
+        let device = conv_state.device();
+        let input = Tensor::from_vec(patterned(512 * 65, 1), (1, 512, 65), device)?
+            .to_dtype(DType::BF16)?;
+        let weight =
+            Tensor::from_vec(patterned(512 * 4, 2), (512, 4), device)?.to_dtype(DType::BF16)?;
+        let b = Tensor::from_vec(patterned(130, 3), (1, 65, 2), device)?.to_dtype(DType::BF16)?;
+        let a = Tensor::from_vec(patterned(130, 4), (1, 65, 2), device)?.to_dtype(DType::BF16)?;
+        let a_log = Tensor::from_vec(vec![-0.1f32, 0.2], 2, device)?;
+        let dt_bias = Tensor::from_vec(vec![-0.2f32, 0.1], 2, device)?;
+        let mut state = recurrent_state.reshape((2, 128, 128))?;
+        let (output, conv_state) = causal_conv1d_cuda(&input, &weight, &conv_state, 4, false)?;
+        let mixed = output.transpose(1, 2)?.contiguous()?;
+        let (q, k, v, g, beta) = prepare_recurrence_inputs_cuda(
+            &mixed, &b, &a, &a_log, &dt_bias, 1, 65, 1, 2, 128, 128,
+        )?;
+        let prefill = warp_gated_delta_rule_recurrence_cuda(&q, &k, &v, &g, &beta, &mut state)?;
+        let token =
+            Tensor::from_vec(patterned(512, 5), (1, 512, 1), device)?.to_dtype(DType::BF16)?;
+        let (decode, conv_state) = causal_conv1d_cuda(&token, &weight, &conv_state, 4, true)?;
+        let mixed = decode.transpose(1, 2)?.contiguous()?;
+        let b = Tensor::from_vec(patterned(2, 6), (1, 1, 2), device)?.to_dtype(DType::BF16)?;
+        let a = Tensor::from_vec(patterned(2, 7), (1, 1, 2), device)?.to_dtype(DType::BF16)?;
+        let decode = fused_decode_recurrence_cuda(
+            &mixed, &b, &a, &a_log, &dt_bias, &mut state, 1, 1, 2, 128, 128,
+        )?;
+        let mut values = flat(&prefill)?;
+        values.extend(flat(&decode)?);
+        Ok((values, conv_state, state.reshape((1, 2, 128, 128))?))
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    #[ignore = "requires two CUDA devices"]
+    fn bf16_layer_device_two_gpu_state_kernels_rotary_and_restore() -> Result<()> {
+        use crate::device_map::{DeviceLayerMapMetadata, DeviceMapMetadata};
+        use crate::kv_cache::RecurrentStateSnapshot;
+        let devices = [Device::new_cuda(0)?, Device::new_cuda(1)?];
+        let mapper = DeviceMapSetting::Map(DeviceMapMetadata::from_num_device_layers(vec![
+            DeviceLayerMapMetadata {
+                ordinal: 0,
+                layers: 2,
+            },
+            DeviceLayerMapMetadata {
+                ordinal: 1,
+                layers: 1,
+            },
+        ]))
+        .into_mapper(3, &devices[0], None, &devices)?;
+        let config = HybridCacheConfig {
+            layer_types: vec![
+                HybridLayerType::Recurrent,
+                HybridLayerType::Attention,
+                HybridLayerType::Recurrent,
+            ],
+            max_seq_len: 32,
+            recurrent: RecurrentLayerConfig {
+                conv_dim: 512,
+                conv_width: 4,
+                state_dims: vec![2, 128, 128],
+                recurrent_dtype: Some(DType::F32),
+            },
+        };
+        let mut cache = HybridCache::new_with_layer_devices(config, DType::BF16, |layer| {
+            mapper.device_for(layer, false).expect("mapped layer")
+        })?;
+        assert_eq!(cache.allocate_seq(), Some(0));
+        let indices = Tensor::from_vec(vec![0u32], 1, &devices[0])?;
+        let mut mapped = HashMap::new();
+        let mut results = Vec::new();
+        for (layer_idx, device_idx) in [(0, 0), (2, 1)] {
+            let pool = cache
+                .get_mut(layer_idx)
+                .and_then(HybridLayerCache::as_recurrent_pool_mut)
+                .expect("recurrent fixture layer");
+            assert!(pool.device().same_device(&devices[device_idx]));
+            let indices =
+                tensor_for_layer(&mut mapped, &indices, &*mapper, layer_idx, pool.device())?;
+            assert!(indices.device().same_device(pool.device()));
+            let (mut values, conv_state, recurrent_state) = run_gdn_pool(
+                pool.gather_conv_state(indices)?,
+                pool.gather_recurrent_state(indices)?,
+            )?;
+            pool.scatter_conv_state_with_host_indices(indices, Some(&[0]), &conv_state)?;
+            pool.scatter_recurrent_state_with_host_indices(indices, Some(&[0]), &recurrent_state)?;
+            values.extend(flat(&pool.gather_conv_state(indices)?)?);
+            values.extend(flat(&pool.gather_recurrent_state(indices)?)?);
+            results.push(values);
+        }
+        assert_eq!(mapped.len(), 2);
+        assert_eq!(results[0].len(), results[1].len());
+        for (&reference, &split) in results[0].iter().zip(&results[1]) {
+            assert!(
+                reference.is_finite() && split.is_finite() && (reference - split).abs() <= 1e-5
+            );
+        }
+        let snapshots: Vec<_> = cache
+            .snapshot_recurrent_state(0)?
+            .into_iter()
+            .map(|snapshot| {
+                Ok(RecurrentStateSnapshot {
+                    conv_state: snapshot.conv_state.to_device(&Device::Cpu)?,
+                    recurrent_state: snapshot.recurrent_state.to_device(&Device::Cpu)?,
+                })
+            })
+            .collect::<Result<_>>()?;
+        cache.reset_seq(0)?;
+        for snapshot in cache.snapshot_recurrent_state(0)? {
+            assert!(flat(&snapshot.conv_state)?.iter().all(|&value| value == 0.));
+            assert!(flat(&snapshot.recurrent_state)?
+                .iter()
+                .all(|&value| value == 0.));
+        }
+        cache.restore_recurrent_state(0, &snapshots)?;
+        for (idx, snapshot) in cache.snapshot_recurrent_state(0)?.iter().enumerate() {
+            assert!(snapshot.conv_state.device().same_device(&devices[idx]));
+            assert!(snapshot.recurrent_state.device().same_device(&devices[idx]));
+            assert_eq!(
+                flat(&snapshot.conv_state)?,
+                flat(&snapshots[idx].conv_state)?
+            );
+            assert_eq!(
+                flat(&snapshot.recurrent_state)?,
+                flat(&snapshots[idx].recurrent_state)?
+            );
+        }
+        let pair = (
+            Tensor::from_vec(patterned(128, 8), (1, 1, 128), &devices[0])?.to_dtype(DType::BF16)?,
+            Tensor::from_vec(patterned(128, 9), (1, 1, 128), &devices[0])?.to_dtype(DType::BF16)?,
+        );
+        let mut rotary = HashMap::new();
+        let mapped_pair = rotary_for_layer(&mut rotary, &pair, &*mapper, 2, &devices[1])?;
+        assert!(mapped_pair.0.device().same_device(&devices[1]));
+        assert!(mapped_pair.1.device().same_device(&devices[1]));
+        assert_eq!(flat(&mapped_pair.0)?, flat(&pair.0)?);
+        assert_eq!(flat(&mapped_pair.1)?, flat(&pair.1)?);
+        let returned = mapper.cast_nm_device(&mapped_pair.0, false)?;
+        assert!(returned.device().same_device(&devices[0]));
+        assert_eq!(flat(&returned)?, flat(&pair.0)?);
+        Ok(())
     }
 }
 

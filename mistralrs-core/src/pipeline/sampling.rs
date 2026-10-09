@@ -264,6 +264,9 @@ pub(crate) async fn finish_or_add_toks_to_seq(
 
             // Send usage on final chunk.
             let usage_opt = if is_done.is_some() {
+                if let Some(reason) = is_done.as_ref() {
+                    seq.mark_final_token(reason);
+                }
                 seq.update_time_info();
                 let usage = seq.get_mut_group().get_usage();
                 seq.get_mut_group().total_prompt_toks = 0;
@@ -304,6 +307,7 @@ pub(crate) async fn finish_or_add_toks_to_seq(
             this.reset_non_granular_state();
         }
     } else if let Some(mut reason) = is_done {
+        seq.mark_final_token(&reason);
         /*
         ***********************
         Finish the sequence now
@@ -592,6 +596,7 @@ pub async fn sample_sequence(
     sample_speculative: bool,
     multiple_sequences: bool,
 ) -> Result<Logprobs> {
+    seq.observation_causal = !sample_speculative;
     activate_required_tool_call_grammar(seq, llg_factory.as_ref(), max_model_len, false);
 
     let logits = logits.squeeze(0)?.squeeze(0)?.to_dtype(DType::F32)?;
@@ -713,6 +718,9 @@ pub async fn sample_sequence(
         }
     }
 
+    if !sample_speculative {
+        seq.observe_sampled_token();
+    }
     Ok(second_logprobs_response)
 }
 

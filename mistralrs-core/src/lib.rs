@@ -29,6 +29,36 @@ use std::{
 use tokio::sync::mpsc::{channel, Sender};
 use tracing::{debug, info, warn};
 
+const WARMUP_ERROR_MAX_CHARS: usize = 256;
+
+fn validate_model_warmup(responses: impl Iterator<Item = Response>) -> Result<(), String> {
+    let mut completed = false;
+    for response in responses {
+        let error = match response {
+            Response::CompletionDone(_) => {
+                completed = true;
+                continue;
+            }
+            Response::ModelError(message, _) | Response::CompletionModelError(message, _) => {
+                message
+            }
+            Response::InternalError(error) | Response::ValidationError(error) => error.to_string(),
+            _ => return Err("Model warmup received an unexpected response type".into()),
+        };
+        return Err(format!(
+            "Model warmup failed: {}",
+            error
+                .chars()
+                .take(WARMUP_ERROR_MAX_CHARS)
+                .collect::<String>()
+        ));
+    }
+    if !completed {
+        return Err("Model warmup closed without a completion response".into());
+    }
+    Ok(())
+}
+
 fn build_engine_runtime() -> Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -1135,7 +1165,7 @@ impl MistralRs {
             tool_callbacks,
         };
 
-        let engine_instance =
+        let mut engine_instance =
             Self::create_engine_instance(pipeline.clone(), method, engine_config, reboot_state)
                 .expect("Failed to create engine instance");
 
@@ -1183,7 +1213,7 @@ impl MistralRs {
             )
         {
             let clone_sender = engine_instance.sender.clone();
-            tokio::task::block_in_place(|| {
+            let warmup_result = tokio::task::block_in_place(|| {
                 let (tx, mut rx) = channel(1);
                 let req = Request::Normal(Box::new(NormalRequest {
                     id: 0,
@@ -1224,24 +1254,19 @@ impl MistralRs {
                 }));
                 debug!("Beginning dummy run.");
                 let start = Instant::now();
-                clone_sender.blocking_send(req).unwrap();
-
-                // Drain all responses from the channel until it's closed
-                let mut received_any = false;
-                while let Some(_resp) = rx.blocking_recv() {
-                    received_any = true;
-                }
-
-                if received_any {
-                    let end = Instant::now();
-                    debug!(
-                        "Dummy run completed in {}s.",
-                        end.duration_since(start).as_secs_f64()
-                    );
-                } else {
-                    warn!("Dummy run failed!");
-                }
+                clone_sender
+                    .blocking_send(req)
+                    .map_err(|_| "Model warmup engine request channel closed".to_string())?;
+                validate_model_warmup(std::iter::from_fn(|| rx.blocking_recv()))?;
+                debug!("Dummy run completed in {}s.", start.elapsed().as_secs_f64());
+                Ok::<(), String>(())
             });
+            if let Err(error) = warmup_result {
+                pipeline.lock().await.cleanup_cuda_graphs();
+                engine_instance.terminate();
+                engine_instance.join();
+                panic!("{error}");
+            }
 
             // Reset logger counters so the dummy run doesn't pollute stats
             engine_instance.logger.reset();
@@ -2106,6 +2131,24 @@ impl MistralRs {
         }
     }
 
+    /// Return the accepted recurrent snapshot host capacity, independent of observation mode and occupancy.
+    pub fn prefix_cache_host_capacity_bytes(&self, model_id: Option<&str>) -> Result<u64, String> {
+        let resolved_model_id = self
+            .resolve_alias_or_default(model_id)
+            .map_err(|e| e.to_string())?;
+        let engines = self
+            .engines
+            .read()
+            .map_err(|_| "Failed to acquire read lock on engines")?;
+        if let Some(engine_instance) = engines.get(&resolved_model_id) {
+            Ok(prefix_cacher::snapshot_host_capacity_bytes(
+                engine_instance.reboot_state.prefix_cache_host_bytes,
+            ) as u64)
+        } else {
+            Err(format!("Model {resolved_model_id} not found"))
+        }
+    }
+
     /// Unload a model from memory while preserving its configuration for later reload.
     /// The model can be reloaded automatically when a request is sent to it, or manually
     /// using `reload_model()`.
@@ -2461,5 +2504,78 @@ impl MistralRs {
         }
 
         Ok(result)
+    }
+}
+
+mod serving_observation;
+pub use serving_observation::inference_observations_enabled;
+
+#[cfg(test)]
+mod bf16_layer_device_warmup_tests {
+    use super::*;
+
+    fn completion() -> CompletionResponse {
+        CompletionResponse {
+            id: "0".into(),
+            choices: Vec::new(),
+            created: 0,
+            model: "fixture".into(),
+            system_fingerprint: response::SYSTEM_FINGERPRINT.into(),
+            object: "text_completion".into(),
+            usage: serde_json::from_str(r#"{"completion_tokens":1,"prompt_tokens":1,"total_tokens":2,"avg_tok_per_sec":0.0,"avg_prompt_tok_per_sec":0.0,"avg_compl_tok_per_sec":0.0,"total_time_sec":0.0,"total_prompt_time_sec":0.0,"total_completion_time_sec":0.0}"#).expect("fixture usage"),
+        }
+    }
+
+    #[test]
+    fn bf16_layer_device_warmup_accepts_completion() {
+        assert!(
+            validate_model_warmup([Response::CompletionDone(completion())].into_iter()).is_ok()
+        );
+    }
+
+    #[test]
+    fn bf16_layer_device_warmup_rejects_error_empty_and_unexpected_response() {
+        let error = validate_model_warmup(
+            [Response::CompletionModelError(
+                "device mismatch".into(),
+                completion(),
+            )]
+            .into_iter(),
+        )
+        .expect_err("model error must reject readiness");
+        assert_eq!(error, "Model warmup failed: device mismatch");
+        assert!(validate_model_warmup(std::iter::empty()).is_err());
+        assert!(validate_model_warmup(
+            [Response::Raw {
+                logits_chunks: Vec::new(),
+                tokens: Vec::new()
+            }]
+            .into_iter()
+        )
+        .is_err());
+        assert!(validate_model_warmup(
+            [Response::InternalError("engine failed".into())].into_iter()
+        )
+        .is_err());
+        assert!(validate_model_warmup(
+            [Response::ValidationError("invalid warmup".into())].into_iter()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn bf16_layer_device_warmup_does_not_hide_errors_after_completion() {
+        let responses = [
+            Response::CompletionDone(completion()),
+            Response::CompletionModelError("late failure".into(), completion()),
+        ];
+        assert!(validate_model_warmup(responses.into_iter()).is_err());
+        let response =
+            Response::CompletionModelError("x".repeat(WARMUP_ERROR_MAX_CHARS * 2), completion());
+        let error = validate_model_warmup([response].into_iter()).expect_err("bounded error");
+        assert_eq!(
+            error.len(),
+            "Model warmup failed: ".len() + WARMUP_ERROR_MAX_CHARS
+        );
     }
 }

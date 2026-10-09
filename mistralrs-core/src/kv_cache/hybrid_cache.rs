@@ -373,9 +373,17 @@ impl HybridCache {
         dtype: candle_core::DType,
         device: &Device,
     ) -> Result<Self> {
+        Self::new_with_layer_devices(config, dtype, |_| device)
+    }
+
+    pub(crate) fn new_with_layer_devices<'a>(
+        config: HybridCacheConfig,
+        dtype: candle_core::DType,
+        mut device_for_layer: impl FnMut(usize) -> &'a Device,
+    ) -> Result<Self> {
         let mut caches = Vec::with_capacity(config.layer_types.len());
 
-        for layer_type in &config.layer_types {
+        for (layer_idx, layer_type) in config.layer_types.iter().enumerate() {
             let cache = match layer_type {
                 HybridLayerType::Attention => HybridLayerCache::Attention(KvCache::new_normal(
                     2,
@@ -388,7 +396,7 @@ impl HybridCache {
                     config.recurrent.state_dims.clone(),
                     dtype,
                     config.recurrent.recurrent_dtype.unwrap_or(dtype),
-                    device,
+                    device_for_layer(layer_idx),
                 )?),
             };
             caches.push(cache);
@@ -543,6 +551,116 @@ impl HybridCache {
 
     pub fn state_indices_host(&self) -> Option<&[u32]> {
         self.state_indices_host.as_deref()
+    }
+}
+
+#[cfg(test)]
+mod bf16_layer_device_tests {
+    use super::*;
+
+    pub(super) fn cache_config() -> HybridCacheConfig {
+        HybridCacheConfig {
+            layer_types: vec![
+                HybridLayerType::Recurrent,
+                HybridLayerType::Attention,
+                HybridLayerType::Recurrent,
+            ],
+            max_seq_len: 32,
+            recurrent: RecurrentLayerConfig {
+                conv_dim: 2,
+                conv_width: 4,
+                state_dims: vec![2, 2, 2],
+                recurrent_dtype: Some(DType::F32),
+            },
+        }
+    }
+
+    fn lifecycle(cache: &mut HybridCache) -> Result<()> {
+        let slots: Vec<_> = (0..5)
+            .map(|_| cache.allocate_seq().expect("fixture slot"))
+            .collect();
+        assert_eq!(slots, vec![0, 1, 2, 3, 4]);
+        for (layer_idx, layer) in cache.caches.iter_mut().enumerate() {
+            if let HybridLayerCache::Recurrent(pool) = layer {
+                assert_eq!(pool.capacity(), 8);
+                let indices = Tensor::from_vec(vec![4u32], 1, pool.device())?;
+                let value = f64::from(u32::try_from(layer_idx + 1).expect("small layer index"));
+                let conv = (pool.gather_conv_state(&indices)?.ones_like()? * value)?;
+                let recurrent = (pool.gather_recurrent_state(&indices)?.ones_like()? * value)?;
+                pool.scatter_conv_state_with_host_indices(&indices, Some(&[4]), &conv)?;
+                pool.scatter_recurrent_state_with_host_indices(&indices, Some(&[4]), &recurrent)?;
+            }
+        }
+        let snapshots = cache.snapshot_recurrent_state(4)?;
+        assert_eq!(snapshots.len(), 2);
+        cache.reset_seq(4)?;
+        for layer in &cache.caches {
+            if let HybridLayerCache::Recurrent(pool) = layer {
+                let indices = Tensor::from_vec(vec![4u32], 1, pool.device())?;
+                assert_eq!(
+                    pool.gather_conv_state(&indices)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?,
+                    vec![0.; 8]
+                );
+                assert_eq!(
+                    pool.gather_recurrent_state(&indices)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?,
+                    vec![0.; 8]
+                );
+            }
+        }
+        cache.restore_recurrent_state(4, &snapshots)?;
+        for (layer_idx, layer) in cache.caches.iter().enumerate() {
+            if let HybridLayerCache::Recurrent(pool) = layer {
+                let indices = Tensor::from_vec(vec![4u32], 1, pool.device())?;
+                let value = u16::try_from(layer_idx + 1).expect("small layer index") as f32;
+                assert_eq!(
+                    pool.gather_conv_state(&indices)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?,
+                    vec![value; 8]
+                );
+                assert_eq!(
+                    pool.gather_recurrent_state(&indices)?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?,
+                    vec![value; 8]
+                );
+            }
+        }
+        cache.free_seq(4);
+        assert_eq!(cache.allocate_seq(), Some(4));
+        let reset = cache.snapshot_recurrent_state(4)?;
+        for snapshot in reset {
+            assert_eq!(
+                snapshot.conv_state.flatten_all()?.to_vec1::<f32>()?,
+                vec![0.; 8]
+            );
+            assert_eq!(
+                snapshot.recurrent_state.flatten_all()?.to_vec1::<f32>()?,
+                vec![0.; 8]
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn bf16_layer_device_single_device_cache_lifecycle() -> Result<()> {
+        let mut cache = HybridCache::new(cache_config(), DType::F32, &Device::Cpu)?;
+        lifecycle(&mut cache)
+    }
+
+    #[test]
+    fn bf16_layer_device_constructor_uses_recurrent_layer_indices() -> Result<()> {
+        let mut visited = Vec::new();
+        let mut cache = HybridCache::new_with_layer_devices(cache_config(), DType::F32, |layer| {
+            visited.push(layer);
+            &Device::Cpu
+        })?;
+        assert_eq!(visited, vec![0, 2]);
+        lifecycle(&mut cache)
     }
 }
 

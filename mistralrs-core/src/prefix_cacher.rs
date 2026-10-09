@@ -89,6 +89,48 @@ fn snapshot_set_bytes(snapshots: &[RecurrentStateSnapshot]) -> usize {
         .sum()
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct SnapshotWriteOutcome {
+    pub written_count: u64,
+    pub written_bytes: u64,
+    pub evicted_entries: u64,
+    pub evicted_bytes: u64,
+}
+
+impl SnapshotWriteOutcome {
+    fn record_eviction(&mut self, bytes: usize) {
+        self.evicted_entries = self.evicted_entries.saturating_add(1);
+        self.evicted_bytes = self
+            .evicted_bytes
+            .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+    }
+}
+
+fn observe_host_copy<T>(
+    observation: Option<&mut crate::EngineObservation>,
+    start: &std::time::Instant,
+    copy: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let copied = copy();
+    if let Some(observation) = observation {
+        let elapsed = u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        observation.snapshot_host_copy_ns = Some(
+            observation
+                .snapshot_host_copy_ns
+                .unwrap_or(0)
+                .saturating_add(elapsed),
+        );
+        if copied.is_err() {
+            observation.snapshot_write_failed();
+        }
+    }
+    copied
+}
+
+pub(crate) fn snapshot_host_capacity_bytes(configured: u64) -> usize {
+    usize::try_from(configured).unwrap_or(usize::MAX)
+}
+
 pub struct PrefixCacheManagerV2 {
     caches: IndexMap<Tokens, CacheElement>,
     /// Recurrent-state snapshots keyed by paged block-hash prefix. Every value
@@ -128,8 +170,7 @@ impl PrefixCacheManagerV2 {
         if !no_prefix_cache && !has_paged_attention {
             info!("Prefix caching enabled (sequence-level, non-paged attention). Expect higher multi-turn throughput for both text and multimodal.");
         }
-        let paged_recurrent_host_capacity_bytes =
-            usize::try_from(host_capacity_bytes).unwrap_or(usize::MAX);
+        let paged_recurrent_host_capacity_bytes = snapshot_host_capacity_bytes(host_capacity_bytes);
         if !no_prefix_cache && has_paged_attention {
             info!(
                 "Recurrent-state prefix snapshots are host-resident, bounded at {} MiB of RAM.",
@@ -262,29 +303,52 @@ impl PrefixCacheManagerV2 {
         key: Vec<BlockHash>,
         snapshots: Vec<RecurrentStateSnapshot>,
     ) -> Result<()> {
+        self.add_paged_recurrent_inner(key, snapshots, None).map(|_| ())
+    }
+
+    fn add_paged_recurrent_inner(
+        &mut self,
+        key: Vec<BlockHash>,
+        snapshots: Vec<RecurrentStateSnapshot>,
+        mut observation: Option<&mut crate::EngineObservation>,
+    ) -> Result<SnapshotWriteOutcome> {
+        if let Some(observation) = observation.as_deref_mut() {
+            observation.begin_snapshot_write();
+        }
         if self.no_prefix_cache
             || !self.has_paged_attention
             || self.paged_recurrent_host_capacity_bytes == 0
             || key.is_empty()
             || snapshots.is_empty()
         {
-            return Ok(());
+            return Ok(SnapshotWriteOutcome::default());
         }
 
         let offload_start = std::time::Instant::now();
-        let mut host_snapshots = Vec::with_capacity(snapshots.len());
-        for snapshot in &snapshots {
-            host_snapshots.push(RecurrentStateSnapshot {
-                conv_state: snapshot.conv_state.to_device(&Device::Cpu)?,
-                recurrent_state: snapshot.recurrent_state.to_device(&Device::Cpu)?,
-            });
-        }
+        let host_snapshots = observe_host_copy(observation.as_deref_mut(), &offload_start, || {
+            snapshots
+                .iter()
+                .map(|snapshot| {
+                    Ok(RecurrentStateSnapshot {
+                        conv_state: snapshot.conv_state.to_device(&Device::Cpu)?,
+                        recurrent_state: snapshot.recurrent_state.to_device(&Device::Cpu)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
         let bytes = snapshot_set_bytes(&host_snapshots);
         debug!(
             "Offloaded a {} MiB recurrent snapshot set to host memory in {:.1} ms",
             bytes / (1024 * 1024),
             offload_start.elapsed().as_secs_f64() * 1000.0
         );
+
+        let observed = mistralrs_quant::serving_observation::enabled();
+        let mut outcome = SnapshotWriteOutcome::default();
+        if observed {
+            outcome.written_count = 1;
+            outcome.written_bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+        }
 
         // Maintain LRU order by reinserting on update.
         if let Some(replaced) = self.paged_recurrent_caches.shift_remove(&key) {
@@ -310,8 +374,25 @@ impl PrefixCacheManagerV2 {
             self.paged_recurrent_host_bytes = self
                 .paged_recurrent_host_bytes
                 .saturating_sub(evicted.bytes);
+            if observed {
+                outcome.record_eviction(evicted.bytes);
+            }
         }
-        Ok(())
+        if let Some(observation) = observation {
+            observation.record_snapshot_write(&outcome);
+        }
+        Ok(outcome)
+    }
+
+    pub(crate) fn add_paged_recurrent_observed(
+        &mut self,
+        key: Vec<BlockHash>,
+        snapshots: Vec<RecurrentStateSnapshot>,
+        observation: Option<&mut crate::EngineObservation>,
+    ) -> Result<()> {
+        let observation = observation.filter(|_| mistralrs_quant::serving_observation::enabled());
+        self.add_paged_recurrent_inner(key, snapshots, observation)
+            .map(|_| ())
     }
 
     /// Lookup a recurrent-state snapshot for a paged-attention block-hash prefix key.
@@ -332,6 +413,22 @@ impl PrefixCacheManagerV2 {
         let out = entry.snapshots.clone();
         self.paged_recurrent_caches.insert(key, entry);
         Some(out)
+    }
+
+    pub(crate) fn recurrent_observation(&self, observation: &mut crate::EngineObservation) {
+        if !mistralrs_quant::serving_observation::enabled() {
+            return;
+        }
+        observation.snapshot_host_bytes = Some(self.paged_recurrent_host_bytes);
+        observation.snapshot_entries = Some(self.paged_recurrent_caches.len());
+        observation.snapshot_capacity_bytes = Some(self.paged_recurrent_host_capacity_bytes);
+        observation.snapshot_placement = Some("host".into());
+        if self.no_prefix_cache
+            || !self.has_paged_attention
+            || self.paged_recurrent_host_capacity_bytes == 0
+        {
+            observation.recurrent_outcome = Some("disabled".into());
+        }
     }
 
     /// Host memory currently held by retained recurrent-state snapshots.
@@ -355,6 +452,27 @@ impl PrefixCacheManagerV2 {
             }
         }
         None
+    }
+
+    pub(crate) fn lookup_paged_recurrent_observed(
+        &mut self,
+        block_hashes: &[BlockHash],
+        max_blocks: usize,
+        observation: &mut crate::EngineObservation,
+    ) -> Option<(usize, Vec<RecurrentStateSnapshot>)> {
+        let start = mistralrs_quant::serving_observation::enabled().then(std::time::Instant::now);
+        self.recurrent_observation(observation);
+        let matching = self.get_longest_paged_recurrent_prefix(block_hashes, max_blocks);
+        if let Some(start) = start {
+            observation.recurrent_lookup_sec = Some(start.elapsed().as_secs_f64());
+            if matching.is_none() {
+                if observation.recurrent_outcome.as_deref() != Some("disabled") {
+                    observation.recurrent_outcome = Some("not_retained".into());
+                }
+                observation.recurrent_restored_tokens = Some(0);
+            }
+        }
+        matching
     }
 
     /// Search for a matching cache given some tokens. Image-containing sequences are now cached too.
@@ -540,8 +658,8 @@ mod tests {
     use candle_core::{DType, Device, Tensor};
 
     use super::{
-        snapshot_set_bytes, CacheElement, MatchingCache, PrefixCacheManagerV2,
-        DEFAULT_PREFIX_CACHE_HOST_BYTES,
+        observe_host_copy, snapshot_set_bytes, CacheElement, MatchingCache, PrefixCacheManagerV2,
+        SnapshotWriteOutcome, DEFAULT_PREFIX_CACHE_HOST_BYTES,
     };
     use crate::kv_cache::{KvCache, RecurrentStateSnapshot, RotatingCache, SingleCache};
     use crate::paged_attention::block_hash::{hash_block_tokens, BlockHash};
@@ -594,6 +712,391 @@ mod tests {
             parent = Some(hash);
         }
         key
+    }
+
+    #[test]
+    fn observation_contract_real_cache_cold_warm_changed_suffix_and_prefix(
+    ) -> candle_core::Result<()> {
+        use crate::paged_attention::{
+            block_hash::compute_block_hashes, kv_cache_manager::KVCacheManager,
+        };
+        let tokens: Vec<u32> = (1..=12).collect();
+        let hashes = compute_block_hashes(&tokens, 4, &[], &[]);
+        let mut kv = KVCacheManager::new(16, 4, true, vec![0]);
+        let mut recurrent =
+            PrefixCacheManagerV2::new(1, false, true, DEFAULT_PREFIX_CACHE_HOST_BYTES);
+        let mut observation = crate::EngineObservation::default();
+        let cold = kv.get_computed_blocks(&hashes, tokens.len());
+        observation.prefix_candidate(true, cold.num_computed_tokens);
+        assert_eq!(
+            observation.cache_outcome.as_deref(),
+            Some("no_matching_kv_prefix")
+        );
+        assert!(recurrent
+            .lookup_paged_recurrent_observed(&hashes, 3, &mut observation)
+            .is_none());
+        assert_eq!(
+            observation.recurrent_outcome.as_deref(),
+            Some("not_retained")
+        );
+
+        assert!(kv.allocate_slots(1, tokens.len(), &[]).is_some());
+        kv.cache_blocks(1, &hashes, tokens.len());
+        kv.free(1);
+        recurrent.add_paged_recurrent_prefix(hashes[..2].to_vec(), make_snapshot_set()?)?;
+        recurrent.add_paged_recurrent_prefix(hashes.to_vec(), make_snapshot_set()?)?;
+        let warm = kv.get_computed_blocks(&hashes, tokens.len());
+        observation.prefix_candidate(true, warm.num_computed_tokens);
+        assert_eq!(warm.num_computed_tokens, 8);
+        let (boundary, _) = recurrent
+            .lookup_paged_recurrent_observed(
+                &hashes,
+                warm.num_computed_tokens / 4,
+                &mut observation,
+            )
+            .expect("warm recurrent prefix");
+        observation.recurrent_restore(true, boundary * 4);
+        observation.final_prefix(tokens.len(), boundary * 4);
+        assert_eq!(observation.uncached_suffix_tokens, Some(4));
+
+        let extended: Vec<u32> = (1..=13).collect();
+        let extended_hashes = compute_block_hashes(&extended, 4, &[], &[]);
+        let extended_hit = kv.get_computed_blocks(&extended_hashes, extended.len());
+        assert_eq!(extended_hit.num_computed_tokens, 12);
+        let (boundary, _) = recurrent
+            .lookup_paged_recurrent_observed(&extended_hashes, 3, &mut observation)
+            .expect("extended recurrent prefix");
+        observation.final_prefix(extended.len(), boundary * 4);
+        assert_eq!(observation.uncached_suffix_tokens, Some(1));
+
+        let changed_suffix = [1, 2, 3, 4, 5, 6, 7, 8, 99, 100, 101, 102];
+        let changed_hashes = compute_block_hashes(&changed_suffix, 4, &[], &[]);
+        assert_eq!(
+            kv.get_computed_blocks(&changed_hashes, changed_suffix.len())
+                .num_computed_tokens,
+            8
+        );
+        assert_eq!(
+            recurrent
+                .lookup_paged_recurrent_observed(&changed_hashes, 3, &mut observation)
+                .expect("shared prefix survives suffix change")
+                .0,
+            2
+        );
+        let changed_prefix = [999, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let changed_hashes = compute_block_hashes(&changed_prefix, 4, &[], &[]);
+        assert_eq!(
+            kv.get_computed_blocks(&changed_hashes, changed_prefix.len())
+                .num_computed_tokens,
+            0
+        );
+        assert!(recurrent
+            .lookup_paged_recurrent_observed(&changed_hashes, 3, &mut observation)
+            .is_none());
+        assert_eq!(
+            observation.recurrent_outcome.as_deref(),
+            Some("not_retained")
+        );
+        assert_eq!(observation.snapshot_entries, Some(2));
+        assert_eq!(observation.snapshot_placement.as_deref(), Some("host"));
+        assert!(observation
+            .snapshot_host_bytes
+            .is_some_and(|bytes| bytes > 0));
+        Ok(())
+    }
+
+    #[test]
+    fn observation_contract_real_cache_disabled_and_multimodal_clamp() -> candle_core::Result<()> {
+        use crate::paged_attention::{
+            block_hash::{
+                clamp_prefix_cache_hit_len, compute_block_hashes, MultiModalFeature,
+                MultimodalAttentionPolicy, MultimodalKind,
+            },
+            kv_cache_manager::KVCacheManager,
+        };
+        let hashes = compute_block_hashes(&[1, 2, 3, 4, 5, 6, 7, 8], 4, &[], &[]);
+        let kv = KVCacheManager::new(16, 4, false, vec![0]);
+        let mut observation = crate::EngineObservation::default();
+        observation.prefix_candidate(
+            false,
+            kv.get_computed_blocks(&hashes, 8).num_computed_tokens,
+        );
+        assert_eq!(observation.cache_outcome.as_deref(), Some("disabled"));
+        for (disabled, capacity) in [(true, DEFAULT_PREFIX_CACHE_HOST_BYTES), (false, 0)] {
+            let mut recurrent = PrefixCacheManagerV2::new(1, disabled, true, capacity);
+            recurrent.add_paged_recurrent_prefix(hashes.to_vec(), make_snapshot_set()?)?;
+            assert!(recurrent
+                .lookup_paged_recurrent_observed(&hashes, 2, &mut observation)
+                .is_none());
+            assert_eq!(observation.recurrent_outcome.as_deref(), Some("disabled"));
+        }
+        let features = [MultiModalFeature {
+            kind: MultimodalKind::Image,
+            item_range: 0..1,
+            hashes: vec![123],
+            offset: 5,
+            length: 4,
+            attention_policy: MultimodalAttentionPolicy::NonCausal,
+            splittable: false,
+        }];
+        observation.prefix_candidate(true, 8);
+        observation.recurrent_restore(true, 8);
+        let clamped = crate::sequence::clamp_prefix_cache_len_for_mm_features(8, 4, &features);
+        let clamped = clamp_prefix_cache_hit_len(clamped, 4, &features);
+        observation.final_prefix(13, clamped);
+        assert_eq!(observation.candidate_prefix_tokens, Some(8));
+        assert_eq!(observation.recurrent_restored_tokens, Some(8));
+        assert_eq!(observation.reused_prefix_tokens, Some(4));
+        assert_eq!(observation.uncached_suffix_tokens, Some(9));
+        Ok(())
+    }
+
+    #[test]
+    fn observation_contract_real_recurrent_restore_failure() -> candle_core::Result<()> {
+        use crate::kv_cache::{
+            HybridCache, HybridCacheConfig, HybridLayerType, RecurrentLayerConfig,
+        };
+        let mut cache = HybridCache::new(
+            HybridCacheConfig {
+                layer_types: vec![HybridLayerType::Recurrent, HybridLayerType::Recurrent],
+                max_seq_len: 32,
+                recurrent: RecurrentLayerConfig {
+                    conv_dim: 4,
+                    conv_width: 64,
+                    state_dims: vec![4, 16, 16],
+                    recurrent_dtype: None,
+                },
+            },
+            DType::F32,
+            &Device::Cpu,
+        )?;
+        let slot = cache.allocate_seq().expect("fixture slot");
+        let mut snapshots = make_snapshot_set()?;
+        let mut observation = crate::EngineObservation::default();
+        observation.recurrent_restore(cache.restore_recurrent_state(slot, &snapshots).is_ok(), 8);
+        assert_eq!(observation.recurrent_outcome.as_deref(), Some("restored"));
+        snapshots[0].conv_state = Tensor::zeros((1, 4, 1), DType::F32, &Device::Cpu)?;
+        observation.recurrent_restore(cache.restore_recurrent_state(slot, &snapshots).is_ok(), 8);
+        observation.final_prefix(
+            13,
+            observation
+                .recurrent_restored_tokens
+                .expect("known restore result"),
+        );
+        assert_eq!(
+            observation.recurrent_outcome.as_deref(),
+            Some("restore_failed")
+        );
+        assert_eq!(observation.reused_prefix_tokens, Some(0));
+        assert_eq!(observation.uncached_suffix_tokens, Some(13));
+        Ok(())
+    }
+
+    #[test]
+    fn observation_contract_snapshot_capacity_eviction_preserves_kv_candidate(
+    ) -> candle_core::Result<()> {
+        use crate::paged_attention::{
+            block_hash::compute_block_hashes, kv_cache_manager::KVCacheManager,
+        };
+        let set_bytes = snapshot_set_bytes(&make_snapshot_set()?);
+        let mut recurrent = PrefixCacheManagerV2::new(1, false, true, (set_bytes * 2) as u64);
+        let mut kv = KVCacheManager::new(64, 4, true, vec![0]);
+        let prompts: Vec<Vec<u32>> = (0..3)
+            .map(|seed| (1..=12).map(|token| token + seed * 100).collect())
+            .collect();
+        let hashes: Vec<_> = prompts
+            .iter()
+            .map(|tokens| compute_block_hashes(tokens, 4, &[], &[]))
+            .collect();
+        let mut write_a = crate::EngineObservation::default();
+        assert_eq!(
+            kv.get_computed_blocks(&hashes[0], 12).num_computed_tokens,
+            0
+        );
+        assert!(kv.allocate_slots(1, 12, &[]).is_some());
+        kv.cache_blocks(1, &hashes[0], 12);
+        kv.free(1);
+        recurrent.add_paged_recurrent_observed(
+            hashes[0][..2].to_vec(),
+            make_snapshot_set()?,
+            Some(&mut write_a),
+        )?;
+        assert_eq!(write_a.snapshot_write_count, Some(1));
+        assert_eq!(write_a.snapshot_write_bytes, Some(set_bytes as u64));
+        assert_eq!(write_a.snapshot_evicted_entries, Some(0));
+        assert_eq!(write_a.snapshot_write_measurement_complete, Some(true));
+
+        let mut warm_a = crate::EngineObservation::default();
+        let candidate = kv.get_computed_blocks(&hashes[0], 12).num_computed_tokens;
+        warm_a.prefix_candidate(true, candidate);
+        let (boundary, _) = recurrent
+            .lookup_paged_recurrent_observed(&hashes[0], candidate / 4, &mut warm_a)
+            .expect("warm A snapshot");
+        warm_a.recurrent_restore(true, boundary * 4);
+        warm_a.final_prefix(12, boundary * 4);
+        assert_eq!(warm_a.reused_prefix_tokens, Some(8));
+        assert_eq!(warm_a.snapshot_write_count, None);
+        assert_eq!(warm_a.snapshot_write_measurement_complete, None);
+
+        for index in 1..3 {
+            assert!(kv.allocate_slots(index + 1, 12, &[]).is_some());
+            kv.cache_blocks(index + 1, &hashes[index], 12);
+            kv.free(index + 1);
+            let mut written = crate::EngineObservation::default();
+            recurrent.add_paged_recurrent_observed(
+                hashes[index][..2].to_vec(),
+                make_snapshot_set()?,
+                Some(&mut written),
+            )?;
+            assert_eq!(written.snapshot_write_count, Some(1));
+            assert_eq!(
+                written.snapshot_evicted_entries,
+                Some(if index == 2 { 1 } else { 0 })
+            );
+            assert_eq!(
+                written.snapshot_evicted_bytes,
+                Some(if index == 2 { set_bytes as u64 } else { 0 })
+            );
+        }
+        let mut final_a = crate::EngineObservation::default();
+        let candidate = kv.get_computed_blocks(&hashes[0], 12).num_computed_tokens;
+        assert_eq!(candidate, 8);
+        final_a.prefix_candidate(true, candidate);
+        assert!(recurrent
+            .lookup_paged_recurrent_observed(&hashes[0], candidate / 4, &mut final_a)
+            .is_none());
+        final_a.final_prefix(12, 0);
+        assert_eq!(final_a.recurrent_outcome.as_deref(), Some("not_retained"));
+        assert_eq!(final_a.candidate_prefix_tokens, Some(8));
+        assert_eq!(final_a.reused_prefix_tokens, Some(0));
+        assert_eq!(final_a.uncached_suffix_tokens, Some(12));
+        assert_eq!(final_a.snapshot_evicted_entries, None);
+        assert_eq!(recurrent.paged_recurrent_host_bytes(), set_bytes * 2);
+        Ok(())
+    }
+
+    #[test]
+    fn observation_contract_snapshot_disabled_too_small_replacement_and_default(
+    ) -> candle_core::Result<()> {
+        assert_eq!(DEFAULT_PREFIX_CACHE_HOST_BYTES, 64 * 1024 * 1024 * 1024);
+        let default = PrefixCacheManagerV2::new(1, false, true, DEFAULT_PREFIX_CACHE_HOST_BYTES);
+        assert_eq!(
+            default.paged_recurrent_host_capacity_bytes,
+            usize::try_from(DEFAULT_PREFIX_CACHE_HOST_BYTES).unwrap_or(usize::MAX)
+        );
+        let maximum = PrefixCacheManagerV2::new(1, false, true, u64::MAX);
+        assert_eq!(maximum.paged_recurrent_host_capacity_bytes, usize::MAX);
+        let set_bytes = snapshot_set_bytes(&make_snapshot_set()?);
+        let key = make_key(1, 2);
+        let mut disabled =
+            PrefixCacheManagerV2::new(1, true, true, DEFAULT_PREFIX_CACHE_HOST_BYTES);
+        let mut disabled_observed = crate::EngineObservation::default();
+        disabled.add_paged_recurrent_observed(
+            key.clone(),
+            make_snapshot_set()?,
+            Some(&mut disabled_observed),
+        )?;
+        assert_eq!(disabled_observed.snapshot_write_count, Some(0));
+        assert_eq!(disabled_observed.snapshot_host_copy_ns, Some(0));
+        assert_eq!(
+            disabled_observed.snapshot_write_measurement_complete,
+            Some(true)
+        );
+        for capacity in [0, set_bytes as u64 - 1] {
+            let mut cache = PrefixCacheManagerV2::new(1, false, true, capacity);
+            let mut observed = crate::EngineObservation::default();
+            cache.add_paged_recurrent_observed(
+                key.clone(),
+                make_snapshot_set()?,
+                Some(&mut observed),
+            )?;
+            assert_eq!(observed.snapshot_write_count, Some(u64::from(capacity > 0)));
+            assert_eq!(
+                observed.snapshot_write_bytes,
+                Some(if capacity > 0 { set_bytes as u64 } else { 0 })
+            );
+            assert_eq!(
+                observed.snapshot_evicted_entries,
+                Some(u64::from(capacity > 0))
+            );
+            assert_eq!(
+                observed.snapshot_evicted_bytes,
+                observed.snapshot_write_bytes
+            );
+            assert_eq!(observed.snapshot_write_measurement_complete, Some(true));
+            assert_eq!(cache.paged_recurrent_host_bytes(), 0);
+            assert!(cache.get_paged_recurrent_prefix(&key).is_none());
+            if capacity == 0 {
+                assert_eq!(observed.snapshot_host_copy_ns, Some(0));
+            }
+        }
+        let mut cache = PrefixCacheManagerV2::new(1, false, true, set_bytes as u64);
+        let mut observed = crate::EngineObservation::default();
+        for _ in 0..2 {
+            cache.add_paged_recurrent_observed(
+                key.clone(),
+                make_snapshot_set()?,
+                Some(&mut observed),
+            )?;
+        }
+        assert_eq!(observed.snapshot_write_count, Some(2));
+        assert_eq!(observed.snapshot_write_bytes, Some((set_bytes * 2) as u64));
+        assert_eq!(observed.snapshot_evicted_entries, Some(0));
+        assert_eq!(observed.snapshot_evicted_bytes, Some(0));
+        assert_eq!(cache.paged_recurrent_host_bytes(), set_bytes);
+        let unobserved = crate::EngineObservation::default();
+        cache.add_paged_recurrent_observed(key, make_snapshot_set()?, None)?;
+        assert_eq!(unobserved.snapshot_write_count, None);
+        assert_eq!(unobserved.snapshot_host_copy_ns, None);
+        Ok(())
+    }
+
+    #[test]
+    fn observation_contract_snapshot_failed_copy_is_sticky_and_counters_saturate() {
+        let mut observed = crate::EngineObservation::default();
+        observed.begin_snapshot_write();
+        let failed: candle_core::Result<()> =
+            observe_host_copy(Some(&mut observed), &std::time::Instant::now(), || {
+                candle_core::bail!("injected copy failure")
+            });
+        assert!(failed.is_err());
+        assert_eq!(observed.snapshot_write_count, Some(0));
+        assert_eq!(observed.snapshot_write_measurement_complete, Some(false));
+        assert!(observed.snapshot_host_copy_ns.is_some());
+        observed.begin_snapshot_write();
+        observed.record_snapshot_write(&SnapshotWriteOutcome {
+            written_count: u64::MAX,
+            written_bytes: u64::MAX,
+            evicted_entries: u64::MAX,
+            evicted_bytes: u64::MAX,
+        });
+        observed.record_snapshot_write(&SnapshotWriteOutcome {
+            written_count: 1,
+            written_bytes: 1,
+            evicted_entries: 1,
+            evicted_bytes: 1,
+        });
+        assert_eq!(observed.snapshot_write_count, Some(u64::MAX));
+        assert_eq!(observed.snapshot_write_bytes, Some(u64::MAX));
+        assert_eq!(observed.snapshot_evicted_entries, Some(u64::MAX));
+        assert_eq!(observed.snapshot_evicted_bytes, Some(u64::MAX));
+        assert_eq!(observed.snapshot_write_measurement_complete, Some(false));
+        observed.snapshot_host_copy_ns = Some(u64::MAX);
+        assert_eq!(
+            observe_host_copy(Some(&mut observed), &std::time::Instant::now(), || Ok(42))
+                .expect("successful copy result"),
+            42
+        );
+        assert_eq!(observed.snapshot_host_copy_ns, Some(u64::MAX));
+        assert_eq!(observed.snapshot_write_measurement_complete, Some(false));
+        let mut eviction = SnapshotWriteOutcome {
+            evicted_entries: u64::MAX,
+            evicted_bytes: u64::MAX,
+            ..Default::default()
+        };
+        eviction.record_eviction(1);
+        assert_eq!(eviction.evicted_entries, u64::MAX);
+        assert_eq!(eviction.evicted_bytes, u64::MAX);
     }
 
     #[test]

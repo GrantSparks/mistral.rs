@@ -5,6 +5,20 @@ use candle_core::{Result, Tensor};
 #[cfg(feature = "cuda")]
 use candle_core::DType;
 
+#[cfg(feature = "cuda")]
+fn ensure_same_device(reference: &Tensor, inputs: &[(&str, &Tensor)]) -> Result<()> {
+    for &(name, tensor) in inputs {
+        if !reference.device().same_device(tensor.device()) {
+            candle_core::bail!(
+                "GDN CUDA {name} device {:?} does not match input device {:?}",
+                tensor.device().location(),
+                reference.device().location()
+            );
+        }
+    }
+    Ok(())
+}
+
 /// CUDA-accelerated gated delta rule recurrence.
 ///
 /// Inputs (all contiguous, f32):
@@ -21,6 +35,16 @@ pub fn gated_delta_rule_recurrence_cuda(
     beta: &Tensor,
     state: &mut Tensor,
 ) -> Result<Tensor> {
+    ensure_same_device(
+        q,
+        &[
+            ("k", k),
+            ("v", v),
+            ("g", g),
+            ("beta", beta),
+            ("state", state),
+        ],
+    )?;
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle_core as candle;
 
@@ -134,6 +158,16 @@ pub fn chunked_gated_delta_rule_recurrence_cuda(
     beta: &Tensor,
     state: &mut Tensor,
 ) -> Result<Tensor> {
+    ensure_same_device(
+        q,
+        &[
+            ("k", k),
+            ("v", v),
+            ("g", g),
+            ("beta", beta),
+            ("state", state),
+        ],
+    )?;
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle_core as candle;
 
@@ -234,6 +268,16 @@ pub fn warp_gated_delta_rule_recurrence_cuda(
     beta: &Tensor,
     state: &mut Tensor,
 ) -> Result<Tensor> {
+    ensure_same_device(
+        q,
+        &[
+            ("k", k),
+            ("v", v),
+            ("g", g),
+            ("beta", beta),
+            ("state", state),
+        ],
+    )?;
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle_core as candle;
 
@@ -344,6 +388,7 @@ pub fn causal_conv1d_cuda(
     kernel_size: usize,
     is_update: bool,
 ) -> Result<(Tensor, Tensor)> {
+    ensure_same_device(x, &[("weight", weight), ("conv_state", conv_state)])?;
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle_core as candle;
     use core::ffi::c_void;
@@ -494,6 +539,10 @@ pub fn prepare_recurrence_inputs_cuda(
     head_k_dim: usize,
     head_v_dim: usize,
 ) -> Result<(Tensor, Tensor, Tensor, Tensor, Tensor)> {
+    ensure_same_device(
+        mixed_qkv,
+        &[("b", b), ("a", a), ("a_log", a_log), ("dt_bias", dt_bias)],
+    )?;
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle_core as candle;
     use core::ffi::c_void;
@@ -676,6 +725,16 @@ pub fn fused_decode_recurrence_cuda(
     head_k_dim: usize,
     head_v_dim: usize,
 ) -> Result<Tensor> {
+    ensure_same_device(
+        mixed_qkv,
+        &[
+            ("b", b),
+            ("a", a),
+            ("a_log", a_log),
+            ("dt_bias", dt_bias),
+            ("state", state),
+        ],
+    )?;
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle_core as candle;
     use core::ffi::c_void;
@@ -831,6 +890,7 @@ pub fn fused_decode_recurrence_cuda(
 /// Computes: beta = sigmoid(b), g = -exp(a_log) * softplus(a + dt_bias)
 #[cfg(feature = "cuda")]
 pub fn rmsnorm_gated_cuda(x: &Tensor, gate: &Tensor, weight: &Tensor, eps: f64) -> Result<Tensor> {
+    ensure_same_device(x, &[("gate", gate), ("weight", weight)])?;
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle_core as candle;
     use core::ffi::c_void;
@@ -927,6 +987,7 @@ pub fn fused_gdn_gating_cuda(
     a_log: &Tensor,
     dt_bias: &Tensor,
 ) -> Result<(Tensor, Tensor)> {
+    ensure_same_device(b, &[("a", a), ("a_log", a_log), ("dt_bias", dt_bias)])?;
     use candle::cuda_backend::cudarc::driver::DevicePtr;
     use candle_core as candle;
     use core::ffi::c_void;
@@ -1027,6 +1088,65 @@ pub fn fused_gdn_gating_cuda(
 mod tests {
     use super::*;
     use candle_core::Device;
+
+    #[test]
+    #[ignore = "requires two CUDA devices"]
+    fn bf16_layer_device_launch_rejects_foreign_tensors() -> Result<()> {
+        let first = Device::new_cuda(0)?;
+        let second = Device::new_cuda(1)?;
+        let local = Tensor::ones(1, DType::F32, &second)?;
+        let mut foreign = Tensor::zeros(1, DType::F32, &first)?;
+        for error in [
+            gated_delta_rule_recurrence_cuda(&local, &local, &local, &local, &local, &mut foreign)
+                .expect_err("foreign scalar state"),
+            chunked_gated_delta_rule_recurrence_cuda(
+                &local,
+                &local,
+                &local,
+                &local,
+                &local,
+                &mut foreign,
+            )
+            .expect_err("foreign chunked state"),
+            warp_gated_delta_rule_recurrence_cuda(
+                &local,
+                &local,
+                &local,
+                &local,
+                &local,
+                &mut foreign,
+            )
+            .expect_err("foreign warp state"),
+            causal_conv1d_cuda(&local, &local, &foreign, 4, false).expect_err("foreign conv state"),
+            prepare_recurrence_inputs_cuda(
+                &local, &local, &local, &foreign, &local, 1, 1, 1, 1, 128, 128,
+            )
+            .expect_err("foreign gating weight"),
+            fused_decode_recurrence_cuda(
+                &local,
+                &local,
+                &local,
+                &local,
+                &local,
+                &mut foreign,
+                1,
+                1,
+                1,
+                128,
+                128,
+            )
+            .expect_err("foreign decode state"),
+            rmsnorm_gated_cuda(&local, &foreign, &local, 1e-6).expect_err("foreign norm gate"),
+            fused_gdn_gating_cuda(&local, &local, &foreign, &local).expect_err("foreign a_log"),
+        ] {
+            let message = error.to_string();
+            assert!(message.contains("GDN CUDA"), "{message}");
+            assert!(message.contains("does not match input device"), "{message}");
+        }
+        second.synchronize()?;
+        assert_eq!(local.to_vec1::<f32>()?, vec![1.]);
+        Ok(())
+    }
 
     #[derive(Clone, Copy)]
     struct RecurrenceCase {

@@ -518,7 +518,7 @@ impl MultimodalModel for Qwen3_5Model {
     }
     #[cfg(feature = "cuda")]
     fn supports_cuda_decode_graphs(&self) -> bool {
-        true
+        self.text.supports_cuda_decode_graphs()
     }
     fn config(&self) -> &ModelConfigMetadata {
         &self.text.cfg

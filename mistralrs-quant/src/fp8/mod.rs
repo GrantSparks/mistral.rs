@@ -291,3 +291,6 @@ impl QuantizedSerde for FP8Linear {
         Ok(IsqType::F8E4M3)
     }
 }
+
+#[cfg(test)]
+mod tests;

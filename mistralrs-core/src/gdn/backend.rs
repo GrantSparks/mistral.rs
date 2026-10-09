@@ -417,6 +417,7 @@ fn recurrence_cuda_from_convolved(
     let mut state_flat = prepare_state_for_backend(cache, dims, batch_size)?;
 
     let out_bh = if seq_len == 1 {
+        crate::serving_observation::GDN_FUSED_DECODE.record();
         crate::cuda::gdn::fused_decode_recurrence_cuda(
             &mixed_qkv,
             &b,

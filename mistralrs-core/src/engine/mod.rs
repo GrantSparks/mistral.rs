@@ -192,33 +192,50 @@ impl PagedPrefixCacheValidator for HybridPagedPrefixValidator {
         cached_tokens: usize,
         block_size: usize,
     ) -> usize {
-        if cached_tokens == 0 || !cached_tokens.is_multiple_of(block_size) {
+        if let Some(reason) = crate::serving_observation::recurrent_candidate_miss(
+            cached_tokens,
+            block_size,
+            seq.recurrent_state_idx().is_some(),
+        ) {
+            if let Some(observation) = seq.snapshot_observation_mut() {
+                observation.recurrent_miss(reason);
+            }
             return 0;
         }
-
         let Some(slot_idx) = seq.recurrent_state_idx() else {
             return 0;
         };
         let max_blocks = cached_tokens / block_size;
-        let Some((n_blocks, snapshots)) = get_mut_arcmutex!(self.prefix_cacher)
-            .get_longest_paged_recurrent_prefix(block_hashes, max_blocks)
-        else {
+        let matching = if let Some(observation) = seq.snapshot_observation_mut() {
+            get_mut_arcmutex!(self.prefix_cacher).lookup_paged_recurrent_observed(
+                block_hashes,
+                max_blocks,
+                observation,
+            )
+        } else {
+            get_mut_arcmutex!(self.prefix_cacher)
+                .get_longest_paged_recurrent_prefix(block_hashes, max_blocks)
+        };
+        let Some((n_blocks, snapshots)) = matching else {
             return 0;
         };
-
         let pipeline = get_mut_arcmutex!(self.pipeline);
         if !pipeline.cache().is_hybrid() {
             return cached_tokens;
         }
         let mut hybrid_cache = pipeline.cache().hybrid();
-        if hybrid_cache
+        let restore_start = seq.snapshot_observation_mut().map(|_| Instant::now());
+        let restored = hybrid_cache
             .restore_recurrent_state(slot_idx, &snapshots)
-            .is_ok()
-        {
-            n_blocks * block_size
-        } else {
-            0
+            .is_ok();
+        if let Some(start) = restore_start {
+            seq.engine_observation.recurrent_restore_sec = Some(start.elapsed().as_secs_f64());
         }
+        let tokens = if restored { n_blocks * block_size } else { 0 };
+        if restore_start.is_some() {
+            seq.engine_observation.recurrent_restore(restored, tokens);
+        }
+        tokens
     }
 }
 
@@ -777,7 +794,7 @@ impl Engine {
                                 let hybrid_cache = pipeline.cache().hybrid();
                                 let mut prefix_cacher = get_mut_arcmutex!(self.prefix_cacher);
 
-                                for seq in guards_mut.iter() {
+                                for seq in guards_mut.iter_mut() {
                                     let encoded_len = seq.num_computed_tokens();
                                     if encoded_len == 0 || encoded_len % block_size != 0 {
                                         continue;
@@ -787,11 +804,19 @@ impl Engine {
                                         continue;
                                     };
 
+                                    if let Some(observation) = seq.snapshot_observation_mut() {
+                                        observation.begin_snapshot_write();
+                                    }
                                     let snapshots = match hybrid_cache
                                         .snapshot_recurrent_state(slot_idx)
                                     {
                                         Ok(snapshots) => snapshots,
                                         Err(e) => {
+                                            if let Some(observation) =
+                                                seq.snapshot_observation_mut()
+                                            {
+                                                observation.snapshot_write_failed();
+                                            }
                                             tracing::warn!(
                                                     "Failed snapshotting recurrent state for sequence {}: {e}",
                                                     seq.id()
@@ -813,9 +838,10 @@ impl Engine {
                                     if block_hashes.len() < num_blocks {
                                         continue;
                                     }
-                                    if let Err(e) = prefix_cacher.add_paged_recurrent_prefix(
+                                    if let Err(e) = prefix_cacher.add_paged_recurrent_observed(
                                         block_hashes[..num_blocks].to_vec(),
                                         snapshots,
+                                        seq.snapshot_observation_mut(),
                                     ) {
                                         tracing::warn!(
                                             "Failed retaining recurrent state for sequence {}: {e}",

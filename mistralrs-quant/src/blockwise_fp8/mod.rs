@@ -29,6 +29,24 @@ pub struct BlockwiseFP8Linear {
     weight_block_size: Vec<usize>,
 }
 
+// Measured large-prefill candidate: retain FP8 storage, but use maintained
+// BF16 dequantization and rank-2 Candle GEMM for the dense forward.
+#[cfg(any(feature = "cuda", test))]
+fn use_bf16_prefill_dequant(
+    cuda: bool,
+    rank: usize,
+    input: DType,
+    weight: DType,
+    rows: usize,
+    weight_elements: usize,
+) -> bool {
+    cuda && rank == 2
+        && input == DType::BF16
+        && weight == DType::BF16
+        && rows >= 128
+        && weight_elements >= 1_048_576
+}
+
 impl QuantMethod for BlockwiseFP8Linear {
     fn new(method: QuantMethodConfig) -> candle_core::Result<Self>
     where
@@ -87,13 +105,32 @@ impl QuantMethod for BlockwiseFP8Linear {
                     x.clone()
                 };
 
-                // Use native FP8 GEMM kernel
-                let result = ops::fp8_blockwise_matmul(
-                    &x_2d,
-                    &self.weight,
-                    &self.weight_scale_inv,
-                    &self.weight_block_size,
-                )?;
+                let dequant_prefill = use_bf16_prefill_dequant(
+                    true,
+                    x_2d.rank(),
+                    x_2d.dtype(),
+                    self.dequant_dtype,
+                    x_2d.dims().first().map_or(0, |rows| *rows),
+                    self.weight.elem_count(),
+                );
+                let result = if dequant_prefill {
+                    crate::serving_observation::FP8_DEQUANT.record();
+                    let unquant = UnquantLinear::new(QuantMethodConfig::Unquantized(Linear::new(
+                        self.dequantize_w()?,
+                        self.bias.as_ref().cloned(),
+                    )))?;
+                    // Keep the measured rank-2 Candle cuBLAS route, including
+                    // bias exactly once, rather than entering batched cuBLASLt.
+                    unquant.forward_raw(&x_2d)?
+                } else {
+                    crate::serving_observation::FP8_NATIVE.record();
+                    ops::fp8_blockwise_matmul(
+                        &x_2d,
+                        &self.weight,
+                        &self.weight_scale_inv,
+                        &self.weight_block_size,
+                    )?
+                };
 
                 // Reshape back to original batch dimensions
                 let result = if orig_dims.len() > 2 {
@@ -105,15 +142,18 @@ impl QuantMethod for BlockwiseFP8Linear {
                     result
                 };
 
-                // Apply bias if present
-                if let Some(ref bias) = self.bias {
-                    return result.broadcast_add(bias);
+                // The selected UnquantLinear path already applied its bias.
+                if !dequant_prefill {
+                    if let Some(ref bias) = self.bias {
+                        return result.broadcast_add(bias);
+                    }
                 }
                 return Ok(result);
             }
         }
 
         // Fallback: dequantize and use unquantized matmul
+        crate::serving_observation::FP8_DEQUANT.record();
         let weight = self.dequantize_w()?;
         // Dispatch to unquant. This uses some cublaslt for bias & on cuda always, so it is better
         let unquant = UnquantLinear::new(QuantMethodConfig::Unquantized(Linear::new(
@@ -467,4 +507,84 @@ pub fn blockwise_fp8_linear_b(
         bias,
         dequant_dtype: vb.dtype(),
     }))
+}
+
+#[cfg(test)]
+mod prefill_selector_tests {
+    use super::*;
+
+    #[test]
+    fn fp8_library_cpu_prefill_selector() {
+        const LARGE_WEIGHT_ELEMENTS: usize = 5120 * 17408;
+        for rows in [0, 1, 32, 127] {
+            assert!(!use_bf16_prefill_dequant(
+                true,
+                2,
+                DType::BF16,
+                DType::BF16,
+                rows,
+                LARGE_WEIGHT_ELEMENTS
+            ));
+        }
+        for rows in [128, 1394] {
+            assert!(use_bf16_prefill_dequant(
+                true,
+                2,
+                DType::BF16,
+                DType::BF16,
+                rows,
+                LARGE_WEIGHT_ELEMENTS
+            ));
+        }
+        for elements in [0, 145 * 257, 1_048_575] {
+            assert!(!use_bf16_prefill_dequant(
+                true,
+                2,
+                DType::BF16,
+                DType::BF16,
+                128,
+                elements
+            ));
+        }
+        assert!(use_bf16_prefill_dequant(
+            true,
+            2,
+            DType::BF16,
+            DType::BF16,
+            128,
+            1_048_576
+        ));
+        assert!(!use_bf16_prefill_dequant(
+            false,
+            2,
+            DType::BF16,
+            DType::BF16,
+            1394,
+            LARGE_WEIGHT_ELEMENTS
+        ));
+        assert!(!use_bf16_prefill_dequant(
+            true,
+            1,
+            DType::BF16,
+            DType::BF16,
+            1394,
+            LARGE_WEIGHT_ELEMENTS
+        ));
+        assert!(!use_bf16_prefill_dequant(
+            true,
+            2,
+            DType::F16,
+            DType::BF16,
+            1394,
+            LARGE_WEIGHT_ELEMENTS
+        ));
+        assert!(!use_bf16_prefill_dequant(
+            true,
+            2,
+            DType::BF16,
+            DType::F16,
+            1394,
+            LARGE_WEIGHT_ELEMENTS
+        ));
+    }
 }

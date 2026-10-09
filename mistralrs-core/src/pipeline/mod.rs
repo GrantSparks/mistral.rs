@@ -1006,7 +1006,7 @@ pub trait Pipeline:
 
     fn snapshot_paged_recurrent_prefix(
         &mut self,
-        seq: &Sequence,
+        seq: &mut Sequence,
         prefix_cacher: &mut PrefixCacheManagerV2,
         block_size: usize,
         cached_tokens: usize,
@@ -1021,15 +1021,30 @@ pub trait Pipeline:
             return Ok(());
         };
 
-        let snapshots = self.cache().hybrid().snapshot_recurrent_state(slot_idx)?;
+        if let Some(observation) = seq.snapshot_observation_mut() {
+            observation.begin_snapshot_write();
+        }
+        let snapshots = self
+            .cache()
+            .hybrid()
+            .snapshot_recurrent_state(slot_idx)
+            .map_err(|error| {
+                if let Some(observation) = seq.snapshot_observation_mut() {
+                    observation.snapshot_write_failed();
+                }
+                error
+            })?;
         if snapshots.is_empty() {
             return Ok(());
         }
         let block_hashes = compute_block_hashes(seq.get_toks(), block_size, seq.mm_features(), &[]);
         let n_blocks = cached_tokens / block_size;
         if block_hashes.len() >= n_blocks {
-            prefix_cacher
-                .add_paged_recurrent_prefix(block_hashes[..n_blocks].to_vec(), snapshots)?;
+            prefix_cacher.add_paged_recurrent_observed(
+                block_hashes[..n_blocks].to_vec(),
+                snapshots,
+                seq.snapshot_observation_mut(),
+            )?;
         }
         Ok(())
     }
@@ -1097,8 +1112,22 @@ pub trait Pipeline:
                     }
 
                     let start = Instant::now();
-                    let raw_logits = self.forward_inputs(inputs, return_raw_logits)?;
+                    let raw_logits = {
+                        let phase = if is_prompt {
+                            mistralrs_quant::serving_observation::HostDispatchPhase::Prefill
+                        } else {
+                            mistralrs_quant::serving_observation::HostDispatchPhase::Decode
+                        };
+                        let _phase_scope =
+                            mistralrs_quant::serving_observation::HostDispatchScope::enter(phase);
+                        self.forward_inputs(inputs, return_raw_logits)?
+                    };
                     let end = Instant::now();
+                    for &seq_idx in &seq_indices {
+                        crate::serving_observation::populate(
+                            &mut input_seqs[seq_idx].engine_observation,
+                        );
+                    }
                     exec_duration += end.duration_since(start);
 
                     for (logit_idx, seq_idx) in seq_indices.into_iter().enumerate() {
@@ -1377,6 +1406,26 @@ pub trait Pipeline:
                         seq.clip_prefix_cache_len_for_non_causal_mm_features(metadata.block_size);
                     }
                 }
+                if is_prompt && mistralrs_quant::serving_observation::enabled() {
+                    for seq in input_seqs.iter_mut() {
+                        let prefix = seq.prefix_cache_len();
+                        let count = seq.get_toks().len();
+                        let observation = &mut seq.engine_observation;
+                        observation.final_prefix(count, prefix);
+                        observation.activation_dtype =
+                            Some(format!("{:?}", self.get_metadata().activation_dtype));
+                        observation.kv_dtype =
+                            self.get_metadata().cache_config.as_ref().map(|config| {
+                                format!(
+                                    "{:?}",
+                                    config
+                                        .cache_type
+                                        .to_dtype(self.get_metadata().activation_dtype)
+                                )
+                            });
+                        observation.paged_block_size = Some(block_size);
+                    }
+                }
                 let has_deferred_multimodal_prompt = input_seqs.iter().any(|seq| {
                     (seq.has_images() || seq.has_audios() || seq.has_videos())
                         && seq.mm_features().is_empty()
@@ -1398,6 +1447,24 @@ pub trait Pipeline:
                         })
                     })
                     .flatten();
+                if is_prompt && mistralrs_quant::serving_observation::enabled() {
+                    for (idx, seq) in input_seqs.iter_mut().enumerate() {
+                        let suffix = seq.get_toks().len().saturating_sub(seq.prefix_cache_len());
+                        let (count, max_tokens) =
+                            chunk_plans.as_ref().map_or((1, suffix), |plans| {
+                                (
+                                    plans[idx].len(),
+                                    plans[idx]
+                                        .iter()
+                                        .map(|chunk| chunk.end - chunk.start)
+                                        .max()
+                                        .unwrap_or(0),
+                                )
+                            });
+                        seq.engine_observation.prefill_chunk_count = Some(count);
+                        seq.engine_observation.prefill_chunk_max_tokens = Some(max_tokens);
+                    }
+                }
                 let should_chunk = chunk_plans
                     .as_ref()
                     .is_some_and(|plans| plans.iter().any(|plan| plan.len() > 1));
@@ -1523,13 +1590,38 @@ pub trait Pipeline:
                         } = inputs.map_err(candle_core::Error::msg)?;
 
                         let start = Instant::now();
-                        let raw_logits = self.forward_inputs(inputs, return_raw_logits)?;
+                        let raw_logits = {
+                            let phase = if is_prompt {
+                                mistralrs_quant::serving_observation::HostDispatchPhase::Prefill
+                            } else {
+                                mistralrs_quant::serving_observation::HostDispatchPhase::Decode
+                            };
+                            let _phase_scope =
+                                mistralrs_quant::serving_observation::HostDispatchScope::enter(
+                                    phase,
+                                );
+                            self.forward_inputs(inputs, return_raw_logits)?
+                        };
                         let end = Instant::now();
+                        if is_prompt && mistralrs_quant::serving_observation::enabled() {
+                            for &seq_idx in &seq_indices {
+                                let observation = &mut input_seqs[seq_idx].engine_observation;
+                                observation.prefill_host_forward_sec = Some(
+                                    observation.prefill_host_forward_sec.unwrap_or(0.0)
+                                        + end.duration_since(start).as_secs_f64(),
+                                );
+                            }
+                        }
+                        for &seq_idx in &seq_indices {
+                            crate::serving_observation::populate(
+                                &mut input_seqs[seq_idx].engine_observation,
+                            );
+                        }
                         exec_duration += end.duration_since(start);
 
                         for (seq_idx, end) in recurrent_boundaries {
                             self.snapshot_paged_recurrent_prefix(
-                                &*input_seqs[seq_idx],
+                                input_seqs[seq_idx],
                                 prefix_cacher,
                                 block_size,
                                 end,

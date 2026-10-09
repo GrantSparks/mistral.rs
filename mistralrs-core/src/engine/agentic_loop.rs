@@ -361,6 +361,7 @@ impl AgenticUsageAccumulator {
             let total_tokens = self.prompt_tokens.saturating_add(self.completion_tokens);
             let total_time_sec = self.total_prompt_time_sec + self.total_completion_time_sec;
             Usage {
+                engine_observation: None,
                 completion_tokens: self.completion_tokens,
                 prompt_tokens: self.prompt_tokens,
                 total_tokens,

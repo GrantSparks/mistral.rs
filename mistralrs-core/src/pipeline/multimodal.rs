@@ -1120,16 +1120,44 @@ impl MultimodalPipeline {
         paged_attn_meta: Option<(Vec<(Tensor, Tensor)>, &PagedAttentionInputMetadata)>,
         flash_meta: &FlashParams,
     ) -> candle_core::Result<Option<Tensor>> {
-        if !cuda_decode_graphs_enabled() || !self.model.supports_cuda_decode_graphs() {
+        if !cuda_decode_graphs_enabled() {
+            crate::serving_observation::record_graph(
+                crate::serving_observation::GraphEvent::Eager(
+                    crate::serving_observation::GraphEagerReason::ConfigurationDisabled,
+                ),
+            );
+            return Ok(None);
+        }
+        if !self.model.supports_cuda_decode_graphs() {
+            crate::serving_observation::record_graph(
+                crate::serving_observation::GraphEvent::Eager(
+                    crate::serving_observation::GraphEagerReason::ModelUnsupported,
+                ),
+            );
             return Ok(None);
         }
         if self.model.has_speculative_proposer() {
+            crate::serving_observation::record_graph(
+                crate::serving_observation::GraphEvent::Eager(
+                    crate::serving_observation::GraphEagerReason::SpeculativeProposer,
+                ),
+            );
             return Ok(None);
         }
         let Some((kv_cache, metadata)) = paged_attn_meta else {
+            crate::serving_observation::record_graph(
+                crate::serving_observation::GraphEvent::Eager(
+                    crate::serving_observation::GraphEagerReason::NoPagedAttention,
+                ),
+            );
             return Ok(None);
         };
         if metadata.is_first_prompt_chunk || metadata.num_cached_tokens.is_some() {
+            crate::serving_observation::record_graph(
+                crate::serving_observation::GraphEvent::Eager(
+                    crate::serving_observation::GraphEagerReason::PromptShape,
+                ),
+            );
             return Ok(None);
         }
         let (batch, q_len) = input_ids.dims2()?;
@@ -1139,9 +1167,20 @@ impl MultimodalPipeline {
             || position_ids.len() != batch
             || !input_ids.device().is_cuda()
         {
+            crate::serving_observation::record_graph(
+                crate::serving_observation::GraphEvent::Eager(
+                    crate::serving_observation::GraphEagerReason::UnsupportedDecodeShape,
+                ),
+            );
             return Ok(None);
         }
+        crate::serving_observation::record_graph(crate::serving_observation::GraphEvent::Eligible);
         let Some(cache_config) = self.metadata.cache_config.as_ref() else {
+            crate::serving_observation::record_graph(
+                crate::serving_observation::GraphEvent::Eager(
+                    crate::serving_observation::GraphEagerReason::NoCacheConfig,
+                ),
+            );
             return Ok(None);
         };
         let hybrid_state_indices = self.hybrid_state_indices_host();
@@ -1153,9 +1192,17 @@ impl MultimodalPipeline {
             .lock()
             .expect("CUDA graph mutex poisoned");
         if state.disabled() {
+            crate::serving_observation::record_graph(
+                crate::serving_observation::GraphEvent::Eager(
+                    crate::serving_observation::GraphEagerReason::DisabledAfterFailure,
+                ),
+            );
             return Ok(None);
         }
         if let Some(logits) = state.replay(&key, input_ids, metadata, seqlen_offsets)? {
+            crate::serving_observation::record_graph(
+                crate::serving_observation::GraphEvent::Replay,
+            );
             return Ok(Some(logits));
         }
 
@@ -1187,6 +1234,9 @@ impl MultimodalPipeline {
         input_ids.device().synchronize()?;
 
         let retained_tensors = self.hybrid_state_indices_tensor().into_iter().collect();
+        crate::serving_observation::record_graph(
+            crate::serving_observation::GraphEvent::CaptureAttempt,
+        );
         let capture_result = capture_cuda_decode_graph(
             CudaDecodeGraphCaptureCtx {
                 key,
@@ -1220,6 +1270,9 @@ impl MultimodalPipeline {
         match capture_result {
             Ok(entry) => {
                 self.restore_hybrid_recurrent_state(warmup_recurrent_snapshots.as_deref())?;
+                crate::serving_observation::record_graph(
+                    crate::serving_observation::GraphEvent::CaptureSuccess,
+                );
                 state.insert(entry);
             }
             Err(err) => {
@@ -1231,6 +1284,7 @@ impl MultimodalPipeline {
     }
 
     fn disable_cuda_decode_graph(&self, err: &candle_core::Error) {
+        crate::serving_observation::record_graph(crate::serving_observation::GraphEvent::Failure);
         let mut state = self
             .cuda_decode_graph
             .lock()

@@ -214,6 +214,8 @@ impl PagedAttentionScheduler {
                 .cloned()
                 .unwrap_or_default();
 
+            let lookup_start =
+                mistralrs_quant::serving_observation::enabled().then(std::time::Instant::now);
             // Look up prefix cache hits
             let kv_mgr = get_mut_arcmutex!(self.kv_cache_manager);
             let mut computed = if self.prefix_caching_enabled {
@@ -226,6 +228,20 @@ impl PagedAttentionScheduler {
             };
             drop(kv_mgr);
 
+            if let Some(lookup_start) = lookup_start {
+                let mut seq_guard = get_mut_arcmutex!(seq);
+                let observation = &mut seq_guard.engine_observation;
+                observation
+                    .prefix_candidate(self.prefix_caching_enabled, computed.num_computed_tokens);
+                observation.prefix_lookup_sec = Some(lookup_start.elapsed().as_secs_f64());
+                if computed.num_computed_tokens == 0 && prefix_validator.is_some() {
+                    observation.recurrent_miss(if self.prefix_caching_enabled {
+                        "no_matching_kv_prefix"
+                    } else {
+                        "disabled"
+                    });
+                }
+            }
             if computed.num_computed_tokens > 0 {
                 if let Some(validator) = prefix_validator.as_deref_mut() {
                     let mut seq_guard = get_mut_arcmutex!(seq);
@@ -337,6 +353,11 @@ impl PagedAttentionScheduler {
             if !did_ignore {
                 let mut seq_guard = get_mut_arcmutex!(seq);
                 seq_guard.set_state(SequenceState::RunningPrompt);
+                if mistralrs_quant::serving_observation::enabled() {
+                    seq_guard
+                        .engine_observation
+                        .final_prefix(num_tokens, num_computed);
+                }
                 seq_guard.set_prefix_cache_len(num_computed);
                 seq_guard.set_num_computed_tokens(num_computed);
             }
