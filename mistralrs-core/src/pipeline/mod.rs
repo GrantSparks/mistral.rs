@@ -173,7 +173,7 @@ use crate::sequence::{SeqStepType, Sequence, SequenceState};
 
 use prompt_chunks::{
     build_prompt_chunk_plan, effective_recurrent_prefix_boundary, is_recurrent_interval_boundary,
-    next_prompt_chunk_group, recurrent_checkpoint_boundary, PromptChunkPlan,
+    next_prompt_chunk_group, PromptChunkPlan,
 };
 
 pub(crate) use self::inputs_processor::{
@@ -2433,20 +2433,6 @@ pub trait Pipeline:
                             .iter()
                             .map(|seq| (seq.get_toks().to_vec(), seq.prefix_cache_len()))
                             .collect::<Vec<_>>();
-                        let recurrent_checkpoint_boundaries = input_seqs
-                            .iter()
-                            .zip(&originals)
-                            .map(|(seq, (tokens, prefix_len))| {
-                                recurrent_checkpoint_boundary(
-                                    tokens.len(),
-                                    *prefix_len,
-                                    hybrid_recurrent.then_some(block_size),
-                                    prefix_policy
-                                        .replay_for(crate::scheduler::modality_signature(seq)),
-                                    seq.mm_features(),
-                                )
-                            })
-                            .collect::<Vec<_>>();
                         let mut plan_indices = vec![0usize; chunk_plans.len()];
                         let requires_uniform_prompt_batch = self.requires_uniform_prompt_batch();
                         let supports_packed_prefill = self.supports_packed_prefill();
@@ -2481,8 +2467,10 @@ pub trait Pipeline:
                                 let seq = &mut input_seqs[seq_idx];
                                 seq.set_prefix_cache_len(chunk.start);
                                 seq.set_prefill_toks(originals[seq_idx].0[..chunk.end].to_vec());
-                                // Interval checkpoints use the final checkpoint's eligibility:
-                                // replay and media must leave the boundary at the chunk end.
+                                // Checkpoint only at interval multiples, where a resumed prefill
+                                // continues on the cold prefill's chunk grid (see
+                                // `RECURRENT_PREFIX_CHECKPOINT_INTERVAL`); replay and media must
+                                // leave the boundary at the chunk end.
                                 let interval_checkpoint = hybrid_recurrent
                                     && is_recurrent_interval_boundary(
                                         chunk.end,
@@ -2496,9 +2484,7 @@ pub trait Pipeline:
                                             .replay_for(crate::scheduler::modality_signature(seq)),
                                         seq.mm_features(),
                                     ) == Some(chunk.end);
-                                if recurrent_checkpoint_boundaries[seq_idx] == Some(chunk.end)
-                                    || interval_checkpoint
-                                {
+                                if interval_checkpoint {
                                     recurrent_boundaries.push((seq_idx, chunk.end));
                                 }
                                 prompt_chunk.rows.push(SpeculativePromptRow {

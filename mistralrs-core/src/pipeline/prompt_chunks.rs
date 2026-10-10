@@ -10,21 +10,39 @@ pub(crate) struct PromptChunkPlan {
     pub(crate) attention_policy: MultimodalAttentionPolicy,
 }
 
-/// Hybrid prefill also checkpoints recurrent state at every multiple of this many tokens. A
-/// prompt that shares only a leading span with an earlier prompt (a long system prompt, a
-/// warmup) then resumes from the last multiple inside that span; the earlier prompt's own
-/// final-block checkpoint lies past the shared span and can never serve it.
+/// Hybrid prefill checkpoints recurrent state only at multiples of this many tokens inside a
+/// prompt. A prompt that shares only a leading span with an earlier prompt (a long system
+/// prompt, a warmup) then resumes from the last multiple inside that span.
+///
+/// Only these positions: a text chunk plan ends a chunk at every multiple, and its chunks after a
+/// multiple depend only on that multiple and the prompt, so a prefill resumed there runs exactly
+/// the chunks a cold prefill of the same prompt runs from there. A checkpoint at any other block
+/// boundary (a prompt's final block, a post-step capture) resumes on a different chunk grid, and
+/// prefill kernels do not give a row the same bits under a different chunk shape.
 ///
 /// It must be a multiple of the paged block size so every multiple is a block boundary a prefix
-/// key can name; 4096 is a multiple of every supported size (8, 16, 32). It also equals the
-/// default prefill token budget, so prompts prefilled in 512- or 4096-token chunks from position
-/// 0 already end chunks there. Each multiple costs one recurrent snapshot copy to host memory.
+/// key can name; 4096 is a multiple of every supported size (8, 16, 32). Each multiple costs one
+/// recurrent snapshot copy to host memory.
 pub(crate) const RECURRENT_PREFIX_CHECKPOINT_INTERVAL: usize = 4096;
 
 /// Whether `end` is an interval multiple inside a `total_len`-token prompt. The end of the prompt
 /// itself is excluded: a prefix hit must leave at least one token to compute.
 pub(crate) fn is_recurrent_interval_boundary(end: usize, total_len: usize) -> bool {
     end > 0 && end < total_len && end.is_multiple_of(RECURRENT_PREFIX_CHECKPOINT_INTERVAL)
+}
+
+/// The leading span of a `prompt_len`-token hybrid prompt whose KV blocks may enter the paged
+/// prefix cache: up to its last interval multiple, the last checkpoint its prefill can take.
+///
+/// A hybrid prefix hit reuses KV only up to a restored checkpoint, so no later request can reuse
+/// a block past this limit. Those blocks are also the only ones computed off the interval grid
+/// (the prompt's final partial interval, decode steps): another prompt sharing that span
+/// computes it in a chunk of a different shape. Keeping them out of the cache keeps every cached
+/// copy of a block bit-identical, so the KV a hit serves matches the KV the checkpoint's own
+/// prefill attended to, and a cold prefill of the same prompt.
+pub(crate) fn recurrent_kv_reuse_limit(prompt_len: usize) -> usize {
+    prompt_len.saturating_sub(1) / RECURRENT_PREFIX_CHECKPOINT_INTERVAL
+        * RECURRENT_PREFIX_CHECKPOINT_INTERVAL
 }
 
 pub(crate) fn next_prompt_chunk_group(
@@ -782,8 +800,8 @@ mod tests {
             .collect()
     }
 
-    /// The chunk ends the pipeline chunk loop snapshots for a hybrid plan at block size 32: the
-    /// final reusable boundary, and each interval boundary its eligibility leaves at the chunk end.
+    /// The chunk ends the pipeline chunk loop snapshots for a hybrid plan at block size 32: each
+    /// interval boundary its eligibility leaves at the chunk end, and nothing else.
     fn checkpoint_ends(
         total_len: usize,
         prefix_len: usize,
@@ -791,8 +809,6 @@ mod tests {
         replay: SpeculativePrefixReplay,
         features: &[MultiModalFeature],
     ) -> Vec<usize> {
-        let final_boundary =
-            recurrent_checkpoint_boundary(total_len, prefix_len, Some(32), replay, features);
         build_prompt_chunk_plan(
             total_len,
             prefix_len,
@@ -803,18 +819,122 @@ mod tests {
         )
         .into_iter()
         .filter(|chunk| {
-            final_boundary == Some(chunk.end)
-                || (is_recurrent_interval_boundary(chunk.end, total_len)
-                    && effective_recurrent_prefix_boundary(
-                        chunk.end,
-                        chunk.start,
-                        32,
-                        replay,
-                        features,
-                    ) == Some(chunk.end))
+            is_recurrent_interval_boundary(chunk.end, total_len)
+                && effective_recurrent_prefix_boundary(chunk.end, chunk.start, 32, replay, features)
+                    == Some(chunk.end)
         })
         .map(|chunk| chunk.end)
         .collect()
+    }
+
+    /// The chunks a scheduler-visible prefill runs: each step plans from the computed position
+    /// and takes the first chunk.
+    fn stepped_spans(
+        total_len: usize,
+        prefix_len: usize,
+        chunk_size: usize,
+    ) -> Vec<(usize, usize)> {
+        let mut spans = Vec::new();
+        let mut pos = prefix_len;
+        while pos < total_len {
+            let chunk = build_prompt_chunk_plan(
+                total_len,
+                pos,
+                chunk_size,
+                Some(32),
+                SpeculativePrefixReplay::NotRequired,
+                &[],
+            )[0];
+            spans.push((chunk.start, chunk.end));
+            pos = chunk.end;
+        }
+        spans
+    }
+
+    const GRID_LENGTHS: [usize; 13] = [
+        4097, 8192, 8193, 8224, 9441, 9582, 9586, 9601, 9637, 10_844, 12_288, 12_289, 16_385,
+    ];
+
+    #[test]
+    fn checkpoints_are_taken_only_at_interval_multiples() {
+        let replay = SpeculativePrefixReplay::NotRequired;
+        for total_len in GRID_LENGTHS {
+            for prefix_len in [0, 4096, 8192].into_iter().filter(|len| *len < total_len) {
+                for chunk_size in [512, 585, 4096, 8192] {
+                    let expected = (1..)
+                        .map(|k| k * RECURRENT_PREFIX_CHECKPOINT_INTERVAL)
+                        .take_while(|end| *end < total_len)
+                        .filter(|end| *end > prefix_len)
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        checkpoint_ends(total_len, prefix_len, chunk_size, replay, &[]),
+                        expected,
+                        "total_len={total_len} prefix_len={prefix_len} chunk_size={chunk_size}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Resuming at any checkpoint runs exactly the chunks a cold prefill runs from there, in the
+    /// pipeline's one-shot plan and in the scheduler's step-by-step plan alike.
+    #[test]
+    fn interval_resume_plans_are_suffixes_of_the_cold_plan() {
+        let replay = SpeculativePrefixReplay::NotRequired;
+        for total_len in GRID_LENGTHS {
+            for chunk_size in [512, 585, 4096, 8192] {
+                let cold = chunk_spans(build_prompt_chunk_plan(
+                    total_len,
+                    0,
+                    chunk_size,
+                    Some(32),
+                    replay,
+                    &[],
+                ));
+                assert_eq!(stepped_spans(total_len, 0, chunk_size), cold);
+                for resume in checkpoint_ends(total_len, 0, chunk_size, replay, &[]) {
+                    assert!(cold.iter().any(|(_, end)| *end == resume));
+                    let suffix = cold
+                        .iter()
+                        .copied()
+                        .filter(|(start, _)| *start >= resume)
+                        .collect::<Vec<_>>();
+                    let warm = chunk_spans(build_prompt_chunk_plan(
+                        total_len,
+                        resume,
+                        chunk_size,
+                        Some(32),
+                        replay,
+                        &[],
+                    ));
+                    assert_eq!(
+                        warm, suffix,
+                        "total_len={total_len} chunk_size={chunk_size} resume={resume}"
+                    );
+                    assert_eq!(stepped_spans(total_len, resume, chunk_size), suffix);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn kv_reuse_limit_is_the_last_checkpoint_inside_the_prompt() {
+        assert_eq!(recurrent_kv_reuse_limit(0), 0);
+        assert_eq!(recurrent_kv_reuse_limit(4096), 0);
+        assert_eq!(recurrent_kv_reuse_limit(4097), 4096);
+        assert_eq!(recurrent_kv_reuse_limit(9586), 8192);
+        assert_eq!(recurrent_kv_reuse_limit(12_288), 8192);
+        assert_eq!(recurrent_kv_reuse_limit(12_289), 12_288);
+        let replay = SpeculativePrefixReplay::NotRequired;
+        for total_len in GRID_LENGTHS {
+            assert_eq!(
+                checkpoint_ends(total_len, 0, 4096, replay, &[])
+                    .last()
+                    .copied()
+                    .unwrap_or(0),
+                recurrent_kv_reuse_limit(total_len)
+            );
+        }
     }
 
     #[test]
@@ -851,7 +971,7 @@ mod tests {
             }
             assert_eq!(
                 checkpoint_ends(9586, 0, chunk_size, replay, &[]),
-                [4096, 8192, 9568]
+                [4096, 8192]
             );
         }
         assert_eq!(
@@ -871,11 +991,8 @@ mod tests {
         assert!(resumed
             .iter()
             .any(|chunk| (chunk.start, chunk.end) == (3616, 4096)));
-        assert_eq!(
-            checkpoint_ends(9586, 1056, 512, replay, &[]),
-            [4096, 8192, 9568]
-        );
-        assert_eq!(checkpoint_ends(9586, 4096, 512, replay, &[]), [8192, 9568]);
+        assert_eq!(checkpoint_ends(9586, 1056, 512, replay, &[]), [4096, 8192]);
+        assert_eq!(checkpoint_ends(9586, 4096, 512, replay, &[]), [8192]);
     }
 
     #[test]
@@ -933,7 +1050,7 @@ mod tests {
             )),
             [(0, 7520), (7520, 9568), (9568, 9586)]
         );
-        assert_eq!(checkpoint_ends(9586, 0, 512, suffix, &[]), [7520]);
+        assert!(checkpoint_ends(9586, 0, 512, suffix, &[]).is_empty());
         let full = SpeculativePrefixReplay::Full;
         assert_eq!(
             chunk_spans(build_prompt_chunk_plan(
@@ -970,9 +1087,6 @@ mod tests {
                 (9568, 9586)
             ]
         );
-        assert_eq!(
-            checkpoint_ends(9586, 0, 16_384, replay, &features),
-            [8192, 9568]
-        );
+        assert_eq!(checkpoint_ends(9586, 0, 16_384, replay, &features), [8192]);
     }
 }

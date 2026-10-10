@@ -22,7 +22,7 @@ Focused portable checks are `make observation-check` and `make observation-test`
 Request-local recurrent snapshot fields are `snapshot_write_count`,
 `snapshot_write_bytes`, `snapshot_evicted_entries`, `snapshot_evicted_bytes`,
 `snapshot_host_copy_ns` and `snapshot_write_measurement_complete`. They follow
-actual chunk/final-boundary writes by the same supported original single-choice
+actual interval-checkpoint writes by the same supported original single-choice
 Sequence. A successful host copy and store counts one write, including a set
 immediately removed because it exceeds capacity. Replacing an existing key is a
 write and does not count as an eviction. Only capacity-driven removal contributes

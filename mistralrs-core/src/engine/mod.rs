@@ -7,7 +7,7 @@ use crate::{
     pipeline::{
         execution::StepSubmissionKind,
         llg::{constraint_from_llg_grammar, llg_grammar_from_constraint},
-        prompt_chunks::effective_recurrent_prefix_boundary,
+        prompt_chunks::{effective_recurrent_prefix_boundary, is_recurrent_interval_boundary},
         text_models_inputs_processor::PagedAttentionMeta,
         CacheBackendMetadata, CacheInstruction, DecodeGraphPrecaptureCtx, StepLookahead,
         StepSubmission, RECURRENT_GRAPH_PAD_SLOTS,
@@ -2213,12 +2213,13 @@ impl Engine {
                             decode_tokens.record(&self.logger, guards_mut.iter().map(|seq| &**seq));
                         }
 
-                        // Capture recurrent states at full-block boundaries so hybrid models can
-                        // reuse recurrent prefix state when paged prefix caching hits. Prompt steps
-                        // only: a chat template re-renders a finished assistant turn differently
-                        // than it was generated, so no later lookup can ever reach a key past the
-                        // end of a prompt. Chunked prefill snapshots inline instead, in
-                        // `snapshot_paged_recurrent_prefix`.
+                        // Capture recurrent states at checkpoint intervals inside the prompt so
+                        // hybrid models can reuse recurrent prefix state when paged prefix caching
+                        // hits. Prompt steps only: a chat template re-renders a finished assistant
+                        // turn differently than it was generated, so no later lookup can ever reach
+                        // a key past the end of a prompt. Chunked prefill snapshots inline instead,
+                        // in `snapshot_paged_recurrent_prefix`, at the same positions: anywhere
+                        // else a resume would leave the cold prefill's chunk grid.
                         {
                             let mut pipeline = get_mut_arcmutex!(self.pipeline);
                             let mut prefix_cacher = get_mut_arcmutex!(self.prefix_cacher);
@@ -2236,7 +2237,11 @@ impl Engine {
                                         continue;
                                     }
                                     let encoded_len = seq.num_computed_tokens();
-                                    if encoded_len == 0 || encoded_len % block_size != 0 {
+                                    if !is_recurrent_interval_boundary(
+                                        encoded_len,
+                                        seq.prompt_tokens(),
+                                    ) || encoded_len % block_size != 0
+                                    {
                                         continue;
                                     }
 

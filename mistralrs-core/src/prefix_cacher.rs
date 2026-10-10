@@ -1582,8 +1582,8 @@ mod tests {
 
     #[test]
     fn interval_checkpoints_of_one_prompt_coexist() -> candle_core::Result<()> {
-        // In 32-token blocks: a 9,441-token warmup checkpoints at 4,096 and 8,192 tokens and at
-        // its final full block, 9,440. A request shares 9,408 tokens (294 blocks) of its KV.
+        // In 32-token blocks: a 9,441-token warmup checkpoints at its interval multiples, 4,096
+        // and 8,192 tokens. A request shares 9,408 tokens (294 blocks) of its KV.
         let warmup = compute_block_hashes(&(0..295).collect::<Vec<u32>>(), 1, &[], &[]);
         let request = compute_block_hashes(
             &(0..294).chain(10_000..10_006).collect::<Vec<u32>>(),
@@ -1596,11 +1596,11 @@ mod tests {
 
         let mut prefix_cacher =
             PrefixCacheManagerV2::new(16, false, true, DEFAULT_PREFIX_CACHE_HOST_BYTES);
-        for n_blocks in [128, 256, 295] {
+        for n_blocks in [128, 256] {
             add_key_owned(&mut prefix_cacher, &warmup, n_blocks)?;
         }
-        assert_eq!(prefix_cacher.paged_recurrent_caches.len(), 3);
-        assert_eq!(prefix_cacher.paged_recurrent_sequence_keys.len(), 3);
+        assert_eq!(prefix_cacher.paged_recurrent_caches.len(), 2);
+        assert_eq!(prefix_cacher.paged_recurrent_sequence_keys.len(), 2);
         let bytes = prefix_cacher.paged_recurrent_bytes;
 
         // The engine resumes from the longest stored key within the KV match.
@@ -1610,17 +1610,17 @@ mod tests {
                 .map(|(n_blocks, _)| n_blocks)
         };
         assert_eq!(longest(&prefix_cacher, &request, 294), Some(256));
-        assert_eq!(longest(&prefix_cacher, &warmup, 295), Some(295));
+        assert_eq!(longest(&prefix_cacher, &warmup, 295), Some(256));
         assert_eq!(longest(&prefix_cacher, &request, 255), Some(128));
 
         // A second cold prompt over the same prefix writes the shared keys again: each replaces
         // its entry under the same owner instead of adding one.
-        for n_blocks in [128, 256, 299] {
+        for n_blocks in [128, 256] {
             add_key_owned(&mut prefix_cacher, &request, n_blocks)?;
         }
-        assert_eq!(prefix_cacher.paged_recurrent_caches.len(), 4);
-        assert_eq!(prefix_cacher.paged_recurrent_sequence_keys.len(), 4);
-        assert_eq!(prefix_cacher.paged_recurrent_bytes, bytes / 3 * 4);
+        assert_eq!(prefix_cacher.paged_recurrent_caches.len(), 2);
+        assert_eq!(prefix_cacher.paged_recurrent_sequence_keys.len(), 2);
+        assert_eq!(prefix_cacher.paged_recurrent_bytes, bytes);
         for n_blocks in [128, 256] {
             assert_eq!(
                 prefix_cacher.paged_recurrent_caches[&request[..n_blocks]].owners,
@@ -1628,11 +1628,11 @@ mod tests {
             );
         }
 
-        // Owned by the prompt's last block instead, the same writes replace one another and the
-        // request finds nothing inside its match.
+        // Owned by the prompt's last block instead, the same writes replace one another and a
+        // request whose match stops short of the last finds nothing inside it.
         let mut prompt_owned =
             PrefixCacheManagerV2::new(16, false, true, DEFAULT_PREFIX_CACHE_HOST_BYTES);
-        for n_blocks in [128, 256, 295] {
+        for n_blocks in [128, 256] {
             prompt_owned.add_paged_recurrent_prefix(
                 warmup[294],
                 warmup[..n_blocks].to_vec(),
@@ -1641,7 +1641,7 @@ mod tests {
             )?;
         }
         assert_eq!(prompt_owned.paged_recurrent_caches.len(), 1);
-        assert_eq!(longest(&prompt_owned, &request, 294), None);
+        assert_eq!(longest(&prompt_owned, &request, 255), None);
 
         Ok(())
     }
@@ -1651,41 +1651,43 @@ mod tests {
     {
         let mut prefix_cacher =
             PrefixCacheManagerV2::new(4, false, true, DEFAULT_PREFIX_CACHE_HOST_BYTES);
-        let first = compute_block_hashes(&(0..12).collect::<Vec<u32>>(), 1, &[], &[]);
+        let first = compute_block_hashes(&(0..13).collect::<Vec<u32>>(), 1, &[], &[]);
         let second =
             compute_block_hashes(&(0..10).chain(100..104).collect::<Vec<u32>>(), 1, &[], &[]);
-        for n_blocks in [4, 8, 11] {
+        for n_blocks in [4, 8, 12] {
             add_key_owned(&mut prefix_cacher, &first, n_blocks)?;
         }
-        // The second prompt resumes from the shared 8-block interval, then writes its final key.
+        // The second prompt resumes from the shared 8-block interval, then writes its own
+        // 12-block interval.
         assert_eq!(
             prefix_cacher
                 .get_longest_paged_recurrent_prefix(&second, 10)
                 .map(|(n_blocks, _)| n_blocks),
             Some(8)
         );
-        add_key_owned(&mut prefix_cacher, &second, 13)?;
+        add_key_owned(&mut prefix_cacher, &second, 12)?;
         assert_eq!(prefix_cacher.paged_recurrent_caches.len(), 4);
 
         // Two more checkpoints evict the two least recently used: the unrefreshed 4-block
-        // interval, then the first prompt's final key. The interval that served a hit stays.
+        // interval, then the first prompt's 12-block interval. The interval that served a hit
+        // stays.
         add_key_owned(&mut prefix_cacher, &block_hashes(1_000, 3), 3)?;
         assert!(!prefix_cacher
             .paged_recurrent_caches
             .contains_key(&first[..4]));
         assert!(prefix_cacher
             .paged_recurrent_caches
-            .contains_key(&first[..11]));
+            .contains_key(&first[..12]));
         add_key_owned(&mut prefix_cacher, &block_hashes(2_000, 3), 3)?;
         assert!(!prefix_cacher
             .paged_recurrent_caches
-            .contains_key(&first[..11]));
+            .contains_key(&first[..12]));
         assert!(prefix_cacher
             .paged_recurrent_caches
             .contains_key(&first[..8]));
         assert!(prefix_cacher
             .paged_recurrent_caches
-            .contains_key(&second[..13]));
+            .contains_key(&second[..12]));
         assert_eq!(prefix_cacher.paged_recurrent_caches.len(), 4);
 
         Ok(())

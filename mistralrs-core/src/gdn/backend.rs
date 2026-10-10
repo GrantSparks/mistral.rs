@@ -2219,7 +2219,7 @@ mod tests {
         use crate::paged_attention::block_hash::compute_block_hashes;
         use crate::pipeline::prompt_chunks::{
             build_prompt_chunk_plan, effective_recurrent_prefix_boundary,
-            is_recurrent_interval_boundary, recurrent_checkpoint_boundary,
+            is_recurrent_interval_boundary,
         };
         use crate::prefix_cacher::{PrefixCacheManagerV2, DEFAULT_PREFIX_CACHE_HOST_BYTES};
         use crate::speculative::SpeculativePrefixReplay;
@@ -2330,8 +2330,6 @@ mod tests {
         let mut prefix_cacher =
             PrefixCacheManagerV2::new(16, false, true, DEFAULT_PREFIX_CACHE_HOST_BYTES);
         let warmup_hashes = compute_block_hashes(&warmup, BLOCK, &[], &[]);
-        let final_boundary =
-            recurrent_checkpoint_boundary(warmup.len(), 0, Some(BLOCK), replay, &[]);
         let warmup_slot = cache.allocate_seq(1)?;
         let mut checkpoints = Vec::new();
         for chunk in build_prompt_chunk_plan(warmup.len(), 0, CHUNK, Some(BLOCK), replay, &[]) {
@@ -2339,7 +2337,7 @@ mod tests {
             let interval_checkpoint = is_recurrent_interval_boundary(chunk.end, warmup.len())
                 && effective_recurrent_prefix_boundary(chunk.end, chunk.start, BLOCK, replay, &[])
                     == Some(chunk.end);
-            if final_boundary == Some(chunk.end) || interval_checkpoint {
+            if interval_checkpoint {
                 let n_blocks = chunk.end / BLOCK;
                 prefix_cacher.add_paged_recurrent_prefix(
                     warmup_hashes[n_blocks - 1],
@@ -2350,7 +2348,7 @@ mod tests {
                 checkpoints.push(chunk.end);
             }
         }
-        assert_eq!(checkpoints, [4096, 8192, 9440]);
+        assert_eq!(checkpoints, [4096, 8192]);
         assert!(cache.release_seq(1, warmup_slot)?);
 
         // Warm request: the engine's lookup within the 9,408-token KV match, then the rest.

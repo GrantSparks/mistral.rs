@@ -18,7 +18,9 @@ use crate::{
         },
         kv_cache_manager::KVCacheManager,
     },
-    pipeline::prompt_chunks::{build_prompt_chunk_plan, next_prompt_chunk_group, PromptChunkPlan},
+    pipeline::prompt_chunks::{
+        build_prompt_chunk_plan, next_prompt_chunk_group, recurrent_kv_reuse_limit, PromptChunkPlan,
+    },
     scheduler::{
         modality_signature, PagedPrefixCacheValidation, PagedPrefixCacheValidator, Scheduler,
         SchedulerOutput,
@@ -284,6 +286,20 @@ impl PagedAttentionScheduler {
 
     fn prompt_chunks_use_block_alignment(&self) -> bool {
         self.prompt_chunks_require_block_alignment && self.prefix_caching_enabled
+    }
+
+    /// Computed tokens of `seq` whose full KV blocks may enter the prefix cache. A model with
+    /// per-sequence prefill state reuses KV only up to a recurrent checkpoint, so its blocks stop
+    /// at `recurrent_kv_reuse_limit`: past it they were computed off the checkpoint grid and could
+    /// only ever be served, for a shared span, beside a checkpoint whose prefill computed that
+    /// span in a chunk of a different shape.
+    fn cacheable_computed_tokens(&self, seq: &Sequence) -> usize {
+        let computed = seq.num_computed_tokens();
+        if self.prefill_has_per_sequence_state {
+            computed.min(recurrent_kv_reuse_limit(seq.prompt_tokens()))
+        } else {
+            computed
+        }
     }
 
     fn supports_scheduler_visible_prompt_chunks(&self, seq: &Sequence) -> bool {
@@ -1303,7 +1319,7 @@ impl PagedAttentionScheduler {
             for seq in running {
                 let seq_guard = get_mut_arcmutex!(seq);
                 let seq_id = *seq_guard.id();
-                let num_computed_tokens = seq_guard.num_computed_tokens();
+                let num_computed_tokens = self.cacheable_computed_tokens(&seq_guard);
                 self.ensure_block_hashes(
                     seq_id,
                     seq_guard.get_toks(),
@@ -1359,7 +1375,7 @@ impl PagedAttentionScheduler {
             let seq_guard = get_mut_arcmutex!(seq);
             if seq_guard.is_finished_paged_attn() {
                 let id = *seq_guard.id();
-                let num_computed_tokens = seq_guard.num_computed_tokens();
+                let num_computed_tokens = self.cacheable_computed_tokens(&seq_guard);
                 if self.prefix_caching_enabled
                     && !matches!(seq_guard.getstate(), SequenceState::Error)
                     && num_computed_tokens >= self.block_size
@@ -1426,7 +1442,7 @@ impl PagedAttentionScheduler {
         seq_guard.clear_staged_speculative_tokens();
         let seq_id = *seq_guard.id();
         self.preempted_sequence_ids.push(seq_id);
-        let num_computed_tokens = seq_guard.num_computed_tokens();
+        let num_computed_tokens = self.cacheable_computed_tokens(&seq_guard);
 
         self.ensure_block_hashes(
             seq_id,
@@ -2058,6 +2074,76 @@ mod tests {
                 .num_computed_tokens,
             0
         );
+    }
+
+    /// A hybrid model caches a prompt's KV blocks only up to its last checkpoint interval, the
+    /// furthest a hybrid prefix hit can reuse; the same prompt on an attention-only model caches
+    /// every full block a hit may use. Each registration site applies the limit: a finished
+    /// sequence, a preempted one, and a running one's per-step registration.
+    #[test]
+    fn hybrid_prefix_cache_keeps_kv_blocks_below_the_last_checkpoint_interval() {
+        #[derive(Debug, Clone, Copy)]
+        enum Registration {
+            Finish,
+            Preempt,
+            DecodeStep,
+        }
+        for (per_sequence_state, registration, cached) in [
+            (false, Registration::Finish, 9568),
+            (false, Registration::DecodeStep, 9568),
+            (true, Registration::Finish, 8192),
+            (true, Registration::Preempt, 8192),
+            (true, Registration::DecodeStep, 8192),
+        ] {
+            let mut scheduler = PagedAttentionScheduler::new(
+                PagedAttentionSchedulerConfig {
+                    max_num_seqs: 1,
+                    max_num_batched_tokens: 4096,
+                    max_prefill_chunk_tokens: 4096,
+                    max_decode_steps_before_prefill: 8,
+                },
+                CacheConfig {
+                    block_size: 32,
+                    num_gpu_blocks: 1024,
+                    cache_type: PagedCacheType::Auto,
+                    kv_cache_group_ids: vec![0],
+                },
+            );
+            scheduler.prefill_has_per_sequence_state = per_sequence_state;
+            let seq_id = 10;
+            let prompt_len = 9586;
+            let seq = test_sequence(seq_id, prompt_len);
+            let tokens = get_mut_arcmutex!(seq).get_toks().to_vec();
+            let hashes = compute_block_hashes(&tokens, scheduler.block_size, &[], &[]);
+            scheduler.ensure_block_hashes(seq_id, &tokens, &[], None, 0);
+            assert!(get_mut_arcmutex!(scheduler.kv_cache_manager)
+                .allocate_slots(seq_id, prompt_len, &[])
+                .is_some());
+            get_mut_arcmutex!(seq).set_num_computed_tokens(prompt_len);
+            match registration {
+                Registration::Finish => {
+                    get_mut_arcmutex!(seq).set_state(SequenceState::Done(StopReason::Eos));
+                    scheduler.running.push_back(seq);
+                    scheduler.free_finished_sequence_groups();
+                }
+                Registration::Preempt => scheduler._preempt(seq),
+                Registration::DecodeStep => {
+                    scheduler.running.push_back(seq);
+                    let logger = IntervalLogger::new(std::time::Duration::from_secs(3600), None);
+                    let output = scheduler.schedule(&logger, None);
+                    assert_eq!(output.scheduled.len(), 1);
+                }
+            }
+
+            let kv_mgr = get_mut_arcmutex!(scheduler.kv_cache_manager);
+            assert_eq!(
+                kv_mgr
+                    .get_computed_blocks(&hashes, prompt_len)
+                    .num_computed_tokens,
+                cached,
+                "per_sequence_state={per_sequence_state} registration={registration:?}"
+            );
+        }
     }
 
     #[test]
