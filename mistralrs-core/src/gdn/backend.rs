@@ -2202,4 +2202,209 @@ mod tests {
         }
         Ok(())
     }
+
+    /// Warm/cold parity for interval recurrent-prefix checkpoints on CPU, one GDN layer below the
+    /// model. A 9,441-token warmup is prefilled through a recurrent state pool in its hybrid chunk
+    /// plan and snapshotted where the pipeline chunk loop snapshots, into the prefix store keyed
+    /// and owned as `Pipeline::snapshot_paged_recurrent_prefix` keys and owns checkpoints. A
+    /// 9,586-token request sharing 9,408 tokens restores the deepest checkpoint inside that match
+    /// into a reused slot and prefills the rest; its outputs and final state must equal a cold
+    /// prefill of the same tokens.
+    #[test]
+    fn interval_checkpoint_restore_continues_like_a_cold_prefill() -> CandleResult<()> {
+        use crate::kv_cache::{
+            HybridCache, HybridCacheConfig, HybridLayerCache, HybridLayerType,
+            RecurrentLayerConfig, RecurrentStateSpec,
+        };
+        use crate::paged_attention::block_hash::compute_block_hashes;
+        use crate::pipeline::prompt_chunks::{
+            build_prompt_chunk_plan, effective_recurrent_prefix_boundary,
+            is_recurrent_interval_boundary, recurrent_checkpoint_boundary,
+        };
+        use crate::prefix_cacher::{PrefixCacheManagerV2, DEFAULT_PREFIX_CACHE_HOST_BYTES};
+        use crate::speculative::SpeculativePrefixReplay;
+
+        const BLOCK: usize = 32;
+        const CHUNK: usize = 512;
+        const VOCAB: u32 = 61;
+        let replay = SpeculativePrefixReplay::NotRequired;
+        let dev = Device::Cpu;
+        let dims = dims(2, 4, 4, 3);
+
+        // Layer inputs are an embedding of each token, so a shared token prefix shares inputs.
+        let table = |width: usize, salt: usize, scale: f32, offset: f32| {
+            Tensor::from_vec(
+                patterned(VOCAB as usize * width, salt, scale, offset),
+                (VOCAB as usize, width),
+                &dev,
+            )
+        };
+        let qkv_table = table(dims.conv_dim, 41, 0.6, 0.0)?;
+        let b_table = table(dims.num_v_heads, 42, 0.8, 0.0)?;
+        let a_table = table(dims.num_v_heads, 43, 0.8, -0.3)?;
+        let conv_weight = Tensor::from_vec(
+            patterned(dims.conv_dim * dims.conv_kernel_size, 44, 0.3, 0.02),
+            (dims.conv_dim, 1, dims.conv_kernel_size),
+            &dev,
+        )?;
+        let a_log = Tensor::from_vec(
+            patterned(dims.num_v_heads, 45, 0.5, -0.5),
+            (dims.num_v_heads,),
+            &dev,
+        )?;
+        let dt_bias = Tensor::from_vec(
+            patterned(dims.num_v_heads, 46, 0.4, 0.2),
+            (dims.num_v_heads,),
+            &dev,
+        )?;
+        let token = |i: u32| (i * 7 + i / 13) % VOCAB;
+        let warmup = (0..9441).map(token).collect::<Vec<_>>();
+        let request = (0..9586)
+            .map(|i| {
+                if i < 9408 {
+                    token(i)
+                } else {
+                    (token(i) + 1) % VOCAB
+                }
+            })
+            .collect::<Vec<_>>();
+
+        let mut cache = HybridCache::new(
+            HybridCacheConfig {
+                layer_types: vec![HybridLayerType::Recurrent],
+                max_seq_len: 16_384,
+                recurrent: RecurrentLayerConfig {
+                    conv_dim: dims.conv_dim,
+                    conv_width: dims.conv_kernel_size,
+                    state: RecurrentStateSpec::Gdn {
+                        heads: dims.num_v_heads,
+                        key_dim: dims.head_k_dim,
+                        value_dim: dims.head_v_dim,
+                    },
+                    recurrent_dtype: Some(DType::F32),
+                },
+            },
+            DType::F32,
+            &[Device::Cpu],
+        )?;
+        // One prefill forward of `tokens` for a sequence, as a model's linear-attention layer
+        // checks out, runs and commits its pool rows.
+        let forward = |cache: &mut HybridCache, seq_id: usize, slot: usize, tokens: &[u32]| {
+            let ids = Tensor::new(tokens, &dev)?;
+            let mixed_qkv = qkv_table.index_select(&ids, 0)?.unsqueeze(0)?;
+            let b = b_table.index_select(&ids, 0)?.unsqueeze(0)?;
+            let a = a_table.index_select(&ids, 0)?.unsqueeze(0)?;
+            cache.install_sequence_state_indices(&[(seq_id, slot)])?;
+            let indices = cache
+                .state_indices_for_layer(0)?
+                .expect("recurrent layer has state indices");
+            let host_indices = cache.state_indices_host().map(<[u32]>::to_vec);
+            let Some(HybridLayerCache::Recurrent(pool)) = cache.get_mut(0) else {
+                candle_core::bail!("layer 0 is not recurrent");
+            };
+            let mut layer_cache = GdnLayerCache::checkout(pool, &indices)?;
+            let convolved = causal_conv1d(
+                &mixed_qkv,
+                &conv_weight,
+                &dims,
+                &mut layer_cache,
+                RecurrentBatchKind::Prefill,
+            )?;
+            let y = apply_recurrence_from_convolved(
+                &convolved,
+                &b,
+                &a,
+                &a_log,
+                &dt_bias,
+                &dims,
+                1,
+                tokens.len(),
+                &mut layer_cache,
+                DType::F32,
+            )?;
+            layer_cache.commit(pool, &indices, host_indices.as_deref())?;
+            Ok::<_, candle_core::Error>(y)
+        };
+
+        // Cold warmup, checkpointed under the chunk loop's condition.
+        let mut prefix_cacher =
+            PrefixCacheManagerV2::new(16, false, true, DEFAULT_PREFIX_CACHE_HOST_BYTES);
+        let warmup_hashes = compute_block_hashes(&warmup, BLOCK, &[], &[]);
+        let final_boundary =
+            recurrent_checkpoint_boundary(warmup.len(), 0, Some(BLOCK), replay, &[]);
+        let warmup_slot = cache.allocate_seq(1)?;
+        let mut checkpoints = Vec::new();
+        for chunk in build_prompt_chunk_plan(warmup.len(), 0, CHUNK, Some(BLOCK), replay, &[]) {
+            forward(&mut cache, 1, warmup_slot, &warmup[chunk.start..chunk.end])?;
+            let interval_checkpoint = is_recurrent_interval_boundary(chunk.end, warmup.len())
+                && effective_recurrent_prefix_boundary(chunk.end, chunk.start, BLOCK, replay, &[])
+                    == Some(chunk.end);
+            if final_boundary == Some(chunk.end) || interval_checkpoint {
+                let n_blocks = chunk.end / BLOCK;
+                prefix_cacher.add_paged_recurrent_prefix(
+                    warmup_hashes[n_blocks - 1],
+                    warmup_hashes[..n_blocks].to_vec(),
+                    cache.snapshot_recurrent_state(1, warmup_slot)?,
+                    None,
+                )?;
+                checkpoints.push(chunk.end);
+            }
+        }
+        assert_eq!(checkpoints, [4096, 8192, 9440]);
+        assert!(cache.release_seq(1, warmup_slot)?);
+
+        // Warm request: the engine's lookup within the 9,408-token KV match, then the rest.
+        let request_hashes = compute_block_hashes(&request, BLOCK, &[], &[]);
+        let max_blocks = effective_recurrent_prefix_boundary(9408, 0, BLOCK, replay, &[])
+            .expect("the KV match is a reusable boundary")
+            / BLOCK;
+        let (n_blocks, checkpoint) = prefix_cacher
+            .peek_longest_paged_recurrent_prefix(&request_hashes, max_blocks)
+            .expect("an interval checkpoint lies inside the KV match");
+        let resumed = n_blocks * BLOCK;
+        assert_eq!(resumed, 8192);
+        assert!(
+            checkpoint.recurrent_snapshots[0]
+                .recurrent_state
+                .abs()?
+                .sum_all()?
+                .to_scalar::<f32>()?
+                > 0.0
+        );
+        let warm_slot = cache.allocate_seq(2)?;
+        cache.restore_recurrent_state(2, warm_slot, &checkpoint.recurrent_snapshots)?;
+        let warm_outputs =
+            build_prompt_chunk_plan(request.len(), resumed, CHUNK, Some(BLOCK), replay, &[])
+                .into_iter()
+                .map(|chunk| forward(&mut cache, 2, warm_slot, &request[chunk.start..chunk.end]))
+                .collect::<CandleResult<Vec<_>>>()?;
+        let warm_outputs = Tensor::cat(&warm_outputs, 1)?;
+        let warm_state = cache.snapshot_recurrent_state(2, warm_slot)?;
+
+        // Cold request: one prefill of every token from a fresh slot.
+        let cold_slot = cache.allocate_seq(3)?;
+        let cold_outputs = forward(&mut cache, 3, cold_slot, &request)?;
+        let cold_state = cache.snapshot_recurrent_state(3, cold_slot)?;
+
+        let values = |tensor: &Tensor| tensor.flatten_all()?.to_vec1::<f32>();
+        assert_eq!(
+            values(&warm_outputs)?,
+            values(&cold_outputs.narrow(1, resumed, request.len() - resumed)?)?,
+            "outputs after the restored interval differ from the cold prefill"
+        );
+        assert_eq!(
+            values(&warm_state[0].conv_state)?,
+            values(&cold_state[0].conv_state)?
+        );
+        assert_eq!(
+            values(&warm_state[0].recurrent_state)?,
+            values(&cold_state[0].recurrent_state)?
+        );
+
+        // Control: the same continuation without the restored state does not match.
+        let unrestored_slot = cache.allocate_seq(4)?;
+        let unrestored = forward(&mut cache, 4, unrestored_slot, &request[resumed..])?;
+        assert_ne!(values(&unrestored)?, values(&warm_outputs)?);
+        Ok(())
+    }
 }

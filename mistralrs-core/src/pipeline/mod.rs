@@ -172,8 +172,8 @@ use crate::paged_attention::block_hash::{
 use crate::sequence::{SeqStepType, Sequence, SequenceState};
 
 use prompt_chunks::{
-    build_prompt_chunk_plan, next_prompt_chunk_group, recurrent_checkpoint_boundary,
-    PromptChunkPlan,
+    build_prompt_chunk_plan, effective_recurrent_prefix_boundary, is_recurrent_interval_boundary,
+    next_prompt_chunk_group, recurrent_checkpoint_boundary, PromptChunkPlan,
 };
 
 pub(crate) use self::inputs_processor::{
@@ -1961,9 +1961,10 @@ pub trait Pipeline:
         );
         let n_blocks = cached_tokens / block_size;
         if block_hashes.len() >= n_blocks {
-            let owner = *block_hashes
-                .last()
-                .expect("recurrent prefix owner requires a full block");
+            // Own each checkpoint by its key's last block, the owner the engine checks before a
+            // post-step capture, so the interval checkpoints of one prompt do not replace each
+            // other. `n_blocks >= 1`: `cached_tokens` is a non-zero block multiple.
+            let owner = block_hashes[n_blocks - 1];
             prefix_cacher.add_paged_recurrent_observed(
                 owner,
                 block_hashes[..n_blocks].to_vec(),
@@ -2480,7 +2481,24 @@ pub trait Pipeline:
                                 let seq = &mut input_seqs[seq_idx];
                                 seq.set_prefix_cache_len(chunk.start);
                                 seq.set_prefill_toks(originals[seq_idx].0[..chunk.end].to_vec());
-                                if recurrent_checkpoint_boundaries[seq_idx] == Some(chunk.end) {
+                                // Interval checkpoints use the final checkpoint's eligibility:
+                                // replay and media must leave the boundary at the chunk end.
+                                let interval_checkpoint = hybrid_recurrent
+                                    && is_recurrent_interval_boundary(
+                                        chunk.end,
+                                        originals[seq_idx].0.len(),
+                                    )
+                                    && effective_recurrent_prefix_boundary(
+                                        chunk.end,
+                                        chunk.start,
+                                        block_size,
+                                        prefix_policy
+                                            .replay_for(crate::scheduler::modality_signature(seq)),
+                                        seq.mm_features(),
+                                    ) == Some(chunk.end);
+                                if recurrent_checkpoint_boundaries[seq_idx] == Some(chunk.end)
+                                    || interval_checkpoint
+                                {
                                     recurrent_boundaries.push((seq_idx, chunk.end));
                                 }
                                 prompt_chunk.rows.push(SpeculativePromptRow {
