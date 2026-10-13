@@ -749,11 +749,45 @@ pub fn build_mm_features_from_ranges_with_policy(
     layout.into_features()
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum AllocatorObservationPhase {
+    PipelineBegin,
+    PrefillBefore,
+    PrefillAfter,
+    Terminal,
+}
+
+impl AllocatorObservationPhase {
+    fn label(self) -> &'static str {
+        match self {
+            Self::PipelineBegin => "PipelineBegin",
+            Self::PrefillBefore => "PrefillBefore",
+            Self::PrefillAfter => "PrefillAfter",
+            Self::Terminal => "Terminal",
+        }
+    }
+
+    fn slot(
+        self,
+        observations: &mut crate::CudaAllocatorObservation,
+    ) -> &mut Option<crate::CudaAllocatorSample> {
+        match self {
+            Self::PipelineBegin => &mut observations.pipeline_begin,
+            Self::PrefillBefore => &mut observations.prefill_before,
+            Self::PrefillAfter => &mut observations.prefill_after,
+            Self::Terminal => &mut observations.terminal,
+        }
+    }
+}
+
 pub struct Sequence {
     pub(crate) engine_observation: crate::EngineObservation,
     observation_start: Option<Instant>,
+    allocator_observation_enabled: bool,
     pub(crate) observation_causal: bool,
     observation_supported: bool,
+    speculative_next_token_is_draft: bool,
+    prefill_host_forward_invalid: bool,
     prefill_geometry_invalid: bool,
     // Metadata, const
     id: usize,
@@ -905,9 +939,14 @@ impl Sequence {
                 .expect("new sequence group must not be locked")
                 .is_streaming;
         Self {
+            allocator_observation_enabled: observation_clock.is_some()
+                && std::env::var("MISTRALRS_CUDA_ALLOCATOR_OBSERVATIONS")
+                    .is_ok_and(|value| value == "1"),
             observation_start: observation_clock.map(|clock| clock.origin),
             observation_causal: false,
             observation_supported: true,
+            speculative_next_token_is_draft: false,
+            prefill_host_forward_invalid: false,
             prefill_geometry_invalid: false,
             engine_observation: if mistralrs_quant::serving_observation::enabled() {
                 crate::EngineObservation {
@@ -1370,6 +1409,109 @@ impl Sequence {
         }
     }
 
+    pub(crate) fn begin_speculative_observation(&mut self) {
+        if self.observation_start.is_none() || !self.observation_supported {
+            return;
+        }
+        let single_choice = get_mut_group!(self).observation_single_choice;
+        if !single_choice {
+            self.disable_exact_observation();
+            return;
+        }
+        self.observation_causal = true;
+        if self.engine_observation.speculative.is_some() {
+            return;
+        }
+        let committed_output_tokens = self.tokens.len().saturating_sub(self.prompt_len);
+        let token_markers_valid =
+            committed_output_tokens == 0 && self.engine_observation.sampled_tokens == 0;
+        self.engine_observation.sampled_tokens = committed_output_tokens;
+        self.engine_observation.token_marker_boundary = if token_markers_valid {
+            "committed_token_after_append"
+        } else {
+            "mixed_sampler_and_committed_token_boundaries"
+        }
+        .into();
+        self.engine_observation.speculative = Some(crate::SpeculativeObservation {
+            committed_output_tokens,
+            token_markers_valid,
+            proposal_host_dispatch_unavailable: Some("no_proposal_dispatch".into()),
+            verification_host_dispatch_unavailable: Some(
+                "target_forward_interval_unavailable".into(),
+            ),
+            ..Default::default()
+        });
+    }
+
+    pub(crate) fn speculative_observation_active(&self) -> bool {
+        self.observation_start.is_some()
+            && self.observation_supported
+            && self.engine_observation.speculative.is_some()
+    }
+
+    pub(crate) fn begin_speculative_verification(&mut self, proposed: usize) {
+        self.begin_speculative_observation();
+        if !self.speculative_observation_active() {
+            return;
+        }
+        self.speculative_next_token_is_draft = false;
+        if let Some(observation) = self.engine_observation.speculative.as_mut() {
+            observation.verification_steps = observation.verification_steps.saturating_add(1);
+            observation.proposed_draft_tokens =
+                observation.proposed_draft_tokens.saturating_add(proposed);
+        }
+    }
+
+    pub(crate) fn observe_speculative_token(&mut self, accepted_draft: bool) {
+        if !self.speculative_observation_active() {
+            return;
+        }
+        self.speculative_next_token_is_draft = accepted_draft;
+        if accepted_draft {
+            if let Some(observation) = self.engine_observation.speculative.as_mut() {
+                observation.accepted_draft_tokens =
+                    observation.accepted_draft_tokens.saturating_add(1);
+            }
+        }
+    }
+
+    pub(crate) fn observe_speculative_proposal_dispatch(
+        &mut self,
+        duration: Option<f64>,
+        single: bool,
+        successful: bool,
+    ) {
+        if !self.speculative_observation_active() {
+            return;
+        }
+        if let Some(observation) = self.engine_observation.speculative.as_mut() {
+            observation.proposal_dispatch(duration, single, successful);
+        }
+    }
+
+    pub(crate) fn observe_prefill_host_forward(&mut self, duration: f64, single: bool) {
+        if self.observation_start.is_none() || !self.observation_supported {
+            return;
+        }
+        self.prefill_host_forward_invalid |= !single;
+        self.engine_observation.prefill_host_forward_sec = Some(
+            self.engine_observation
+                .prefill_host_forward_sec
+                .unwrap_or(0.0)
+                + duration,
+        );
+    }
+
+    pub(crate) fn mark_speculative_incomplete(&mut self, reason: &str) {
+        if !self.speculative_observation_active() {
+            return;
+        }
+        if let Some(observation) = self.engine_observation.speculative.as_mut() {
+            observation.measurement_complete = false;
+            observation.terminal_reason = Some(reason.into());
+        }
+    }
+
     pub(crate) fn snapshot_observation_mut(&mut self) -> Option<&mut crate::EngineObservation> {
         if self.observation_start.is_none()
             || !self.observation_supported
@@ -1396,6 +1538,130 @@ impl Sequence {
         }
         self.engine_observation.finish_reason = Some(reason.to_string());
         self.engine_observation.final_token_marker = self.engine_observation.sampled_tokens > 0;
+        self.refine_speculative_terminal_reason(reason);
+    }
+
+    pub(crate) fn refine_speculative_terminal_reason(&mut self, reason: &StopReason) {
+        if !self.speculative_observation_active() {
+            return;
+        }
+        if let Some(observation) = self.engine_observation.speculative.as_mut() {
+            if !matches!(
+                observation.terminal_reason.as_deref(),
+                Some("canceled" | "error")
+            ) {
+                observation.measurement_complete = !matches!(reason, StopReason::Canceled);
+                observation.terminal_reason = Some(
+                    match reason {
+                        StopReason::Eos => "eos",
+                        StopReason::StopTok(_) => "stop_token",
+                        StopReason::Length(_) => "max_output_tokens",
+                        StopReason::ModelLength(_) => "model_length",
+                        StopReason::StopString { .. } => "stop_string",
+                        StopReason::Canceled => "canceled",
+                        StopReason::GeneratedImage => "generated_image",
+                        StopReason::GeneratedSpeech => "generated_speech",
+                        StopReason::ToolCalls => "tool_calls",
+                    }
+                    .into(),
+                );
+            }
+        }
+    }
+
+    pub(crate) fn allocator_observation_pending(
+        &mut self,
+        phase: AllocatorObservationPhase,
+    ) -> bool {
+        self.allocator_observation_enabled
+            && self.observation_supported
+            && self.observation_start.is_some()
+            && (!matches!(phase, AllocatorObservationPhase::Terminal) || !self.response_is_closed())
+            && self
+                .engine_observation
+                .cuda_allocator
+                .as_mut()
+                .is_none_or(|observations| phase.slot(observations).is_none())
+    }
+
+    // The injected closure is private bookkeeping, not a production callback API.
+    fn observe_allocator_with(
+        &mut self,
+        phase: AllocatorObservationPhase,
+        query: impl FnOnce() -> crate::CudaAllocatorSample,
+    ) {
+        if !self.allocator_observation_pending(phase) {
+            return;
+        }
+        let Some(origin) = self.observation_start else {
+            return;
+        };
+        let start = Instant::now();
+        let mut sample = query();
+        let end = Instant::now();
+        sample.phase = phase.label().into();
+        sample.scope = "primary_device".into();
+        sample.query_start_sequence_elapsed_ns =
+            u64::try_from(start.duration_since(origin).as_nanos()).unwrap_or(u64::MAX);
+        sample.query_end_sequence_elapsed_ns =
+            u64::try_from(end.duration_since(origin).as_nanos()).unwrap_or(u64::MAX);
+        *phase.slot(
+            self.engine_observation
+                .cuda_allocator
+                .get_or_insert_with(Default::default),
+        ) = Some(sample);
+    }
+
+    pub(crate) fn observe_cuda_allocator(
+        &mut self,
+        phase: AllocatorObservationPhase,
+        device: &candle_core::Device,
+    ) {
+        self.observe_allocator_with(phase, || {
+            let mut sample = crate::CudaAllocatorSample::default();
+            match device.location() {
+                candle_core::DeviceLocation::Cuda { gpu_id } => {
+                    sample.cuda_device_ordinal = Some(gpu_id)
+                }
+                _ => {
+                    sample.unavailable = Some("non_cuda_device".into());
+                    return sample;
+                }
+            }
+            #[cfg(feature = "cuda")]
+            match crate::utils::memory_usage::MemoryUsage.query_cuda_allocator(device) {
+                Ok(Some(snapshot)) => {
+                    sample.total_bytes = Some(snapshot.total);
+                    sample.free_bytes = Some(snapshot.available);
+                    sample.async_pool =
+                        snapshot
+                            .async_pool
+                            .map(|pool| crate::CudaAllocatorPoolObservation {
+                                used_bytes: pool.current.used,
+                                reserved_bytes: pool.current.reserved,
+                                used_high_bytes: pool.used_high,
+                                reserved_high_bytes: pool.reserved_high,
+                                release_threshold_bytes: pool.release_threshold,
+                            });
+                    sample.graph_pool =
+                        snapshot
+                            .graph_pool
+                            .map(|pool| crate::CudaAllocatorGraphObservation {
+                                used_bytes: pool.used,
+                                reserved_bytes: pool.reserved,
+                                used_high_bytes: pool.used_high,
+                                reserved_high_bytes: pool.reserved_high,
+                            });
+                }
+                Ok(None) => sample.unavailable = Some("allocator_unavailable".into()),
+                Err(_) => sample.unavailable = Some("query_failed".into()),
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                sample.unavailable = Some("cuda_feature_disabled".into());
+            }
+            sample
+        });
     }
 
     pub(crate) fn record_prefix_cache_hit(&mut self) -> bool {
@@ -1790,6 +2056,21 @@ impl Sequence {
 
         self.cumulative_logprob += tok.logprob;
         self.tokens.push(tok.token);
+        if self.speculative_observation_active() {
+            let draft = std::mem::take(&mut self.speculative_next_token_is_draft);
+            if let Some(observation) = self.engine_observation.speculative.as_mut() {
+                observation.committed_output_tokens =
+                    observation.committed_output_tokens.saturating_add(1);
+                if draft {
+                    observation.committed_draft_tokens =
+                        observation.committed_draft_tokens.saturating_add(1);
+                }
+            }
+            if let Some(start) = self.observation_start {
+                self.engine_observation
+                    .accepted_token(u64::try_from(start.elapsed().as_nanos()).unwrap_or(u64::MAX));
+            }
+        }
         self.logprobs.push(tok);
         self.reset_prefill_toks();
         is_done
@@ -2038,6 +2319,25 @@ impl Sequence {
         {
             let mut observation = self.engine_observation.clone();
             observation.prompt_tokens = self.prompt_len;
+            if let Some(speculative) = observation.speculative.as_mut() {
+                speculative.cache_fields_valid = observation.candidate_prefix_tokens.is_some()
+                    || observation.recurrent_outcome.is_some()
+                    || observation.reused_prefix_tokens.is_some();
+                speculative.prefill_geometry_valid = !self.prefill_geometry_invalid
+                    && observation.prefill_chunk_count.is_some()
+                    && observation.prefill_chunk_max_tokens.is_some();
+                speculative.prefill_host_forward_sec_valid = !self.prefill_host_forward_invalid
+                    && observation.prefill_host_forward_sec.is_some();
+                let terminal = match self.getstate() {
+                    SequenceState::Error => Some("error"),
+                    SequenceState::Done(StopReason::Canceled) => Some("canceled"),
+                    _ => None,
+                };
+                if let Some(reason) = terminal {
+                    speculative.measurement_complete = false;
+                    speculative.terminal_reason = Some(reason.into());
+                }
+            }
             if let (Some(start), Some(kind)) = (self.step_start_instant, self.step_timing_kind) {
                 match kind {
                     StepTimingKind::Prompt => {
@@ -2891,7 +3191,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn observation_contract_speculative_entry_permanently_clears_prior_usage() {
+    fn observation_contract_unsupported_path_permanently_clears_prior_usage() {
         let mut seq = make_observed_test_sequence();
         seq.observation_causal = true;
         seq.observe_sampled_token();
@@ -2906,6 +3206,285 @@ pub(crate) mod tests {
         seq.update_time_info();
         assert!(seq.get_mut_group().get_usage().engine_observation.is_none());
         assert_eq!(seq.engine_observation.sampled_tokens, 1);
+    }
+
+    #[test]
+    fn observation_contract_speculative_final_step_is_in_terminal_usage_before_outcome() {
+        let mut seq = make_observed_test_sequence();
+        seq.begin_speculative_observation();
+        seq.add_token(test_logprobs(9), b"a".to_vec(), None);
+        seq.begin_speculative_verification(3);
+        seq.observe_speculative_token(true);
+        seq.add_token(test_logprobs(10), b"b".to_vec(), None);
+        seq.observe_speculative_token(false);
+        seq.add_token(test_logprobs(11), b"c".to_vec(), None);
+        seq.begin_speculative_verification(7);
+        seq.observe_speculative_token(true);
+        let reason = StopReason::Length(4);
+        seq.add_token(test_logprobs(12), b"d".to_vec(), Some(reason));
+        seq.mark_final_token(&reason);
+        seq.update_time_info();
+        let observation = seq
+            .get_mut_group()
+            .get_usage()
+            .engine_observation
+            .expect("terminal usage");
+        let speculative = observation.speculative.expect("speculative terminal usage");
+        assert_eq!(speculative.verification_steps, 2);
+        assert_eq!(speculative.proposed_draft_tokens, 10);
+        assert_eq!(speculative.accepted_draft_tokens, 2);
+        assert_eq!(speculative.committed_draft_tokens, 2);
+        assert_eq!(speculative.committed_output_tokens, 4);
+        assert!(speculative.measurement_complete);
+        assert_eq!(
+            speculative.terminal_reason.as_deref(),
+            Some("max_output_tokens")
+        );
+        assert!(speculative.token_markers_valid);
+        assert_eq!(observation.sampled_tokens, 4);
+        assert!(observation.final_token_marker);
+        assert!(
+            observation.first_token_sequence_elapsed_ns
+                <= observation.last_token_sequence_elapsed_ns
+        );
+    }
+
+    #[test]
+    fn observation_contract_speculative_terminal_hidden_tokens_are_committed() {
+        for (reason, expected) in [
+            (StopReason::Eos, "eos"),
+            (StopReason::StopTok(9), "stop_token"),
+        ] {
+            let mut seq = make_observed_test_sequence();
+            seq.begin_speculative_verification(7);
+            seq.observe_speculative_token(true);
+            seq.add_token(test_logprobs(9), b"hidden".to_vec(), Some(reason));
+            seq.mark_final_token(&reason);
+            seq.update_time_info();
+            assert!(seq.completion_bytes().is_empty());
+            let observation = seq
+                .get_mut_group()
+                .get_usage()
+                .engine_observation
+                .expect("hidden terminal usage");
+            let speculative = observation.speculative.expect("speculative terminal");
+            assert_eq!(speculative.accepted_draft_tokens, 1);
+            assert_eq!(speculative.committed_draft_tokens, 1);
+            assert_eq!(speculative.committed_output_tokens, 1);
+            assert_eq!(speculative.proposed_draft_tokens, 7);
+            assert_eq!(speculative.terminal_reason.as_deref(), Some(expected));
+            assert!(speculative.measurement_complete);
+            assert_eq!(
+                observation.first_token_sequence_elapsed_ns,
+                observation.last_token_sequence_elapsed_ns
+            );
+        }
+    }
+
+    #[test]
+    fn observation_contract_speculative_stop_string_and_nonvisible_appends_count() {
+        let mut seq = make_observed_test_sequence();
+        seq.stop_strings = vec!["STOP".into()];
+        seq.begin_speculative_verification(7);
+        seq.observe_speculative_token(true);
+        seq.add_token(test_logprobs(9), Vec::new(), None);
+        seq.observe_speculative_token(true);
+        let reason = seq
+            .add_token(test_logprobs(10), b"okSTOPtail".to_vec(), None)
+            .expect("stop string");
+        assert_eq!(seq.completion_bytes(), b"ok");
+        seq.mark_final_token(&reason);
+        seq.update_time_info();
+        let observation = seq
+            .get_mut_group()
+            .get_usage()
+            .engine_observation
+            .expect("stop usage");
+        let speculative = observation.speculative.expect("speculative stop");
+        assert_eq!(speculative.accepted_draft_tokens, 2);
+        assert_eq!(speculative.committed_draft_tokens, 2);
+        assert_eq!(speculative.committed_output_tokens, 2);
+        assert_eq!(speculative.terminal_reason.as_deref(), Some("stop_string"));
+        assert!(speculative.measurement_complete);
+    }
+
+    #[test]
+    fn observation_contract_speculative_maximum_clips_uninspected_proposal_tail() {
+        let mut seq = make_observed_test_sequence();
+        seq.max_len = Some(2);
+        seq.begin_speculative_observation();
+        seq.add_token(test_logprobs(9), b"a".to_vec(), None);
+        seq.begin_speculative_verification(7);
+        seq.observe_speculative_token(true);
+        let reason = seq
+            .is_done(10, None, usize::MAX)
+            .expect("last allowed output token");
+        assert_eq!(reason, StopReason::Length(2));
+        seq.add_token(test_logprobs(10), b"b".to_vec(), Some(reason));
+        seq.mark_final_token(&reason);
+        seq.update_time_info();
+        let observation = seq
+            .get_mut_group()
+            .get_usage()
+            .engine_observation
+            .expect("clipped usage");
+        let speculative = observation.speculative.expect("speculative clipping");
+        assert_eq!(speculative.proposed_draft_tokens, 7);
+        assert_eq!(speculative.accepted_draft_tokens, 1);
+        assert_eq!(speculative.committed_draft_tokens, 1);
+        assert_eq!(speculative.committed_output_tokens, 2);
+    }
+
+    #[test]
+    fn observation_contract_speculative_failed_append_and_canceled_or_error_snapshots_are_partial()
+    {
+        for (state, reason) in [
+            (SequenceState::Error, "error"),
+            (SequenceState::Done(StopReason::Canceled), "canceled"),
+        ] {
+            let mut seq = make_observed_test_sequence();
+            seq.begin_speculative_verification(7);
+            seq.observe_speculative_token(true);
+            seq.set_state(state);
+            seq.update_time_info();
+            let observation = seq
+                .get_mut_group()
+                .get_usage()
+                .engine_observation
+                .expect("partial snapshot");
+            let speculative = observation.speculative.expect("speculative partial");
+            assert_eq!(speculative.verification_steps, 1);
+            assert_eq!(speculative.proposed_draft_tokens, 7);
+            assert_eq!(speculative.accepted_draft_tokens, 1);
+            assert_eq!(speculative.committed_draft_tokens, 0);
+            assert_eq!(speculative.committed_output_tokens, 0);
+            assert!(!speculative.measurement_complete);
+            assert_eq!(speculative.terminal_reason.as_deref(), Some(reason));
+        }
+        let mut seq = make_observed_test_sequence();
+        seq.begin_speculative_verification(3);
+        seq.mark_speculative_incomplete("canceled");
+        seq.mark_final_token(&StopReason::Eos);
+        seq.update_time_info();
+        let observation = seq
+            .get_mut_group()
+            .get_usage()
+            .engine_observation
+            .expect("closed sender snapshot");
+        let speculative = observation.speculative.expect("speculative canceled");
+        assert!(!speculative.measurement_complete);
+        assert_eq!(speculative.terminal_reason.as_deref(), Some("canceled"));
+    }
+
+    #[test]
+    fn observation_contract_speculative_entry_keeps_prior_commits_with_unknown_mixed_markers() {
+        let mut seq = make_observed_test_sequence();
+        seq.observe_sampled_token();
+        seq.add_token(test_logprobs(9), b"a".to_vec(), None);
+        seq.begin_speculative_verification(3);
+        seq.observe_speculative_token(false);
+        seq.add_token(
+            test_logprobs(10),
+            b"b".to_vec(),
+            Some(StopReason::Length(2)),
+        );
+        seq.mark_final_token(&StopReason::Length(2));
+        seq.update_time_info();
+        let observation = seq
+            .get_mut_group()
+            .get_usage()
+            .engine_observation
+            .expect("mixed boundary usage");
+        let speculative = observation.speculative.expect("speculative boundary");
+        assert_eq!(speculative.committed_output_tokens, 2);
+        assert_eq!(speculative.accepted_draft_tokens, 0);
+        assert_eq!(speculative.committed_draft_tokens, 0);
+        assert_eq!(observation.sampled_tokens, 2);
+        assert!(!speculative.token_markers_valid);
+        assert!(!speculative.raw_prompt_sec_valid);
+        assert!(!speculative.raw_completion_sec_valid);
+        assert_eq!(speculative.verification_host_dispatch_sec, None);
+        assert_eq!(
+            speculative
+                .verification_host_dispatch_unavailable
+                .as_deref(),
+            Some("target_forward_interval_unavailable")
+        );
+    }
+
+    #[test]
+    fn observation_contract_speculative_observation_off_preserves_usage_bytes_and_output() {
+        let mut ordinary = make_observed_test_sequence();
+        let mut speculative = make_observed_test_sequence();
+        ordinary.observation_start = None;
+        speculative.observation_start = None;
+        speculative.begin_speculative_verification(7);
+        speculative.observe_speculative_token(true);
+        speculative.observe_speculative_proposal_dispatch(Some(0.25), true, true);
+        for seq in [&mut ordinary, &mut speculative] {
+            seq.add_token(test_logprobs(9), b"a".to_vec(), Some(StopReason::Length(1)));
+            seq.mark_final_token(&StopReason::Length(1));
+            seq.update_time_info();
+        }
+        assert_eq!(ordinary.get_toks(), speculative.get_toks());
+        assert_eq!(ordinary.completion_bytes(), speculative.completion_bytes());
+        assert!(speculative.engine_observation.speculative.is_none());
+        assert_eq!(
+            serde_json::to_string(&ordinary.get_mut_group().get_usage()).expect("ordinary usage"),
+            serde_json::to_string(&speculative.get_mut_group().get_usage())
+                .expect("disabled usage")
+        );
+    }
+
+    #[test]
+    fn observation_contract_speculative_multichoice_stays_unsupported_after_error() {
+        let mut seq = make_observed_test_sequence();
+        seq.group = Arc::new(Mutex::new(SequenceGroup::new(2, false, true, None)));
+        seq.begin_speculative_verification(7);
+        seq.set_state(SequenceState::Error);
+        seq.begin_speculative_verification(3);
+        seq.update_time_info();
+        assert!(seq.engine_observation.speculative.is_none());
+        assert!(seq.get_mut_group().get_usage().engine_observation.is_none());
+    }
+
+    #[test]
+    fn observation_contract_speculative_validity_preserves_source_cache_and_geometry_only() {
+        let mut seq = make_observed_test_sequence();
+        seq.engine_observation.prefix_candidate(true, 6);
+        seq.set_prefix_cache_len(4);
+        seq.observe_prefill_forward(Some(4));
+        seq.observe_prefill_host_forward(0.5, true);
+        seq.begin_speculative_observation();
+        seq.update_time_info();
+        let observation = seq
+            .get_mut_group()
+            .get_usage()
+            .engine_observation
+            .expect("source observations");
+        let speculative = observation.speculative.expect("speculative validity");
+        assert!(speculative.cache_fields_valid);
+        assert_eq!(observation.candidate_prefix_tokens, Some(6));
+        assert_eq!(observation.reused_prefix_tokens, Some(4));
+        assert_eq!(observation.uncached_suffix_tokens, Some(4));
+        assert!(speculative.prefill_geometry_valid);
+        assert!(speculative.prefill_host_forward_sec_valid);
+        seq.observe_prefill_host_forward(1.0, false);
+        seq.observe_prefill_host_forward(0.5, true);
+        seq.observe_prefill_forward(None);
+        seq.observe_prefill_forward(Some(4));
+        seq.update_time_info();
+        let observation = seq
+            .get_mut_group()
+            .get_usage()
+            .engine_observation
+            .expect("invalid geometry snapshot");
+        let speculative = observation.speculative.expect("speculative invalidity");
+        assert!(!speculative.prefill_geometry_valid);
+        assert!(!speculative.prefill_host_forward_sec_valid);
+        assert_eq!(observation.prefill_host_forward_sec, Some(2.0));
+        assert_eq!(observation.prefill_chunk_count, None);
+        assert!(speculative.cache_fields_valid);
     }
 
     #[test]
@@ -3006,6 +3585,167 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn observation_contract_allocator_off_never_calls_query_and_keeps_json() {
+        let mut seq = make_observed_test_sequence();
+        seq.allocator_observation_enabled = false;
+        let before = serde_json::to_string(&seq.engine_observation).expect("before");
+        for phase in [
+            AllocatorObservationPhase::PipelineBegin,
+            AllocatorObservationPhase::PrefillBefore,
+            AllocatorObservationPhase::PrefillAfter,
+            AllocatorObservationPhase::Terminal,
+        ] {
+            seq.observe_allocator_with(phase, || panic!("disabled query"));
+        }
+        assert_eq!(
+            before,
+            serde_json::to_string(&seq.engine_observation).expect("after")
+        );
+        assert!(seq.engine_observation.cuda_allocator.is_none());
+        seq.allocator_observation_enabled = true;
+        seq.observation_start = None;
+        seq.observe_allocator_with(AllocatorObservationPhase::PipelineBegin, || {
+            panic!("no origin")
+        });
+    }
+
+    #[test]
+    fn observation_contract_allocator_four_slots_once_raw_values_and_brackets() {
+        let mut seq = make_observed_test_sequence();
+        let (tx, _rx) = channel(1);
+        seq.responder = tx;
+        seq.allocator_observation_enabled = true;
+        seq.observation_start = Some(Instant::now());
+        let calls = std::cell::Cell::new(0);
+        for phase in [
+            AllocatorObservationPhase::PipelineBegin,
+            AllocatorObservationPhase::PrefillBefore,
+            AllocatorObservationPhase::PrefillAfter,
+            AllocatorObservationPhase::Terminal,
+        ] {
+            seq.observe_allocator_with(phase, || {
+                calls.set(calls.get() + 1);
+                crate::CudaAllocatorSample {
+                    cuda_device_ordinal: Some(7),
+                    total_bytes: Some(0),
+                    free_bytes: Some(19),
+                    async_pool: Some(crate::CudaAllocatorPoolObservation {
+                        used_bytes: 31,
+                        reserved_bytes: 0,
+                        used_high_bytes: 11,
+                        reserved_high_bytes: 3,
+                        release_threshold_bytes: 0,
+                    }),
+                    graph_pool: Some(crate::CudaAllocatorGraphObservation {
+                        used_bytes: 0,
+                        reserved_bytes: 29,
+                        used_high_bytes: 2,
+                        reserved_high_bytes: 1,
+                    }),
+                    ..Default::default()
+                }
+            });
+            seq.observe_allocator_with(phase, || panic!("duplicate phase"));
+        }
+        assert_eq!(calls.get(), 4);
+        let observed = seq
+            .engine_observation
+            .cuda_allocator
+            .as_ref()
+            .expect("slots");
+        for (sample, label) in [
+            (&observed.pipeline_begin, "PipelineBegin"),
+            (&observed.prefill_before, "PrefillBefore"),
+            (&observed.prefill_after, "PrefillAfter"),
+            (&observed.terminal, "Terminal"),
+        ] {
+            let sample = sample.as_ref().expect("sample");
+            assert_eq!(sample.phase, label);
+            assert_eq!(sample.scope, "primary_device");
+            assert!(sample.query_start_sequence_elapsed_ns <= sample.query_end_sequence_elapsed_ns);
+            assert_eq!(sample.cuda_device_ordinal, Some(7));
+            assert_eq!(sample.total_bytes, Some(0));
+            assert_eq!(sample.free_bytes, Some(19));
+            let pool = sample.async_pool.as_ref().expect("pool");
+            assert_eq!(
+                (
+                    pool.used_bytes,
+                    pool.reserved_bytes,
+                    pool.used_high_bytes,
+                    pool.reserved_high_bytes,
+                    pool.release_threshold_bytes
+                ),
+                (31, 0, 11, 3, 0)
+            );
+            let graph = sample.graph_pool.as_ref().expect("graph");
+            assert_eq!(
+                (
+                    graph.used_bytes,
+                    graph.reserved_bytes,
+                    graph.used_high_bytes,
+                    graph.reserved_high_bytes
+                ),
+                (0, 29, 2, 1)
+            );
+        }
+    }
+
+    #[test]
+    fn observation_contract_allocator_failure_absence_and_terminal_before_usage() {
+        let mut seq = make_observed_test_sequence();
+        let (tx, rx) = channel(1);
+        seq.responder = tx;
+        seq.allocator_observation_enabled = true;
+        seq.observation_start = Some(Instant::now());
+        seq.observation_causal = true;
+        seq.observe_allocator_with(AllocatorObservationPhase::PipelineBegin, || {
+            crate::CudaAllocatorSample {
+                unavailable: Some("query_failed".into()),
+                ..Default::default()
+            }
+        });
+        seq.observe_allocator_with(AllocatorObservationPhase::PrefillBefore, || {
+            crate::CudaAllocatorSample {
+                total_bytes: Some(9),
+                free_bytes: Some(0),
+                ..Default::default()
+            }
+        });
+        // No proven successful final prompt boundary: PrefillAfter remains absent.
+        seq.observe_allocator_with(AllocatorObservationPhase::Terminal, || {
+            crate::CudaAllocatorSample::default()
+        });
+        crate::utils::prepare_pipeline_error_observation(&mut seq);
+        seq.observe_allocator_with(AllocatorObservationPhase::Terminal, || {
+            panic!("later error cannot requery terminal")
+        });
+        seq.update_time_info();
+        let usage = seq.get_mut_group().get_usage();
+        let observed = usage
+            .engine_observation
+            .expect("usage")
+            .cuda_allocator
+            .expect("allocator");
+        let failed = observed.pipeline_begin.expect("failure");
+        assert_eq!(failed.unavailable.as_deref(), Some("query_failed"));
+        assert!(failed.total_bytes.is_none() && failed.free_bytes.is_none());
+        assert!(failed.async_pool.is_none() && failed.graph_pool.is_none());
+        let before = observed.prefill_before.expect("pre");
+        assert_eq!(before.free_bytes, Some(0));
+        assert!(before.async_pool.is_none() && before.graph_pool.is_none());
+        assert!(observed.prefill_after.is_none());
+        assert!(observed.terminal.is_some());
+        drop(rx);
+        let mut disconnected = make_observed_test_sequence();
+        disconnected.allocator_observation_enabled = true;
+        disconnected.observation_start = Some(Instant::now());
+        disconnected.observe_allocator_with(AllocatorObservationPhase::Terminal, || {
+            panic!("disconnected terminal")
+        });
+        assert!(disconnected.engine_observation.cuda_allocator.is_none());
+    }
+
     fn make_test_sequence_with_seed(seed: Option<u64>) -> Sequence {
         make_test_sequence_with_layers_and_seed(0, seed)
     }
@@ -3014,6 +3754,13 @@ pub(crate) mod tests {
     /// accounting reads the first layer cache, so they need a layer.
     pub(crate) fn make_observed_test_sequence() -> Sequence {
         make_test_sequence_with_layers_and_seed(1, None)
+    }
+
+    pub(crate) fn make_allocator_observed_test_sequence(enabled: bool) -> Sequence {
+        let mut seq = make_observed_test_sequence();
+        seq.allocator_observation_enabled = enabled;
+        seq.observation_start = Some(Instant::now());
+        seq
     }
 
     pub(crate) fn make_observed_deferred_media_test_sequence() -> Sequence {

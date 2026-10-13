@@ -1686,6 +1686,62 @@ pub struct SpeculativePromptRow {
     pub tokens: Vec<u32>,
 }
 
+// Resolve the actual primary device only when at least one retained slot is pending.
+fn observe_allocator_boundary(
+    sequences: &mut [&mut Sequence],
+    indices: &[usize],
+    phase: crate::sequence::AllocatorObservationPhase,
+    device: impl FnOnce() -> Device,
+) {
+    observe_allocator_boundary_if(sequences, indices, phase, |_| true, device);
+}
+
+// The final-chunk selector can scan the batch; do not evaluate it when disabled
+// or when every participating sequence already retained this phase.
+fn observe_allocator_boundary_if(
+    sequences: &mut [&mut Sequence],
+    indices: &[usize],
+    phase: crate::sequence::AllocatorObservationPhase,
+    select: impl FnOnce(usize) -> bool,
+    device: impl FnOnce() -> Device,
+) {
+    if !indices.iter().any(|&index| {
+        sequences
+            .get_mut(index)
+            .is_some_and(|seq| seq.allocator_observation_pending(phase))
+    }) {
+        return;
+    }
+    if !select(sequences.len()) {
+        return;
+    }
+    let device = device();
+    for &index in indices {
+        if let Some(seq) = sequences.get_mut(index) {
+            seq.observe_cuda_allocator(phase, &device);
+        }
+    }
+}
+
+fn allocator_final_prompt_chunk(
+    is_prompt: bool,
+    chunk: Option<&SpeculativePromptChunk>,
+    indices: &[usize],
+    batch_len: usize,
+) -> bool {
+    is_prompt
+        && chunk.is_some_and(|chunk| {
+            chunk.is_final_prompt_chunk
+                && !indices.is_empty()
+                && chunk.rows.len() == indices.len()
+                && indices.iter().enumerate().all(|(position, &index)| {
+                    index < batch_len
+                        && !indices[..position].contains(&index)
+                        && chunk.rows.iter().filter(|row| row.seq_idx == index).count() == 1
+                })
+        })
+}
+
 pub struct SpeculativePromptChunk {
     /// In forward-batch order (row `i` of the batch is `rows[i].seq_idx`)
     pub rows: Vec<SpeculativePromptRow>,
@@ -2074,6 +2130,20 @@ pub trait Pipeline:
         logger: &IntervalLogger,
         lookahead: StepLookahead,
     ) -> Result<StepSubmission, candle_core::Error> {
+        // This starts after scheduler admission, not at load or request arrival.
+        if input_seqs.iter_mut().any(|seq| {
+            seq.allocator_observation_pending(
+                crate::sequence::AllocatorObservationPhase::PipelineBegin,
+            )
+        }) {
+            let device = self.device();
+            for seq in input_seqs.iter_mut() {
+                seq.observe_cuda_allocator(
+                    crate::sequence::AllocatorObservationPhase::PipelineBegin,
+                    &device,
+                );
+            }
+        }
         match backend_metadata {
             CacheBackendMetadata::DefaultInstructions { pre_op, post_op } => {
                 if !is_prompt && !return_raw_logits {
@@ -2130,6 +2200,14 @@ pub trait Pipeline:
                         && ((self.supports_batched_cuda_sampling()
                             && sampling::can_sample_batch_cuda(input_seqs))
                             || crate::speculative::verifier::can_batch_device_verify(input_seqs));
+                    if is_prompt {
+                        observe_allocator_boundary(
+                            input_seqs,
+                            &seq_indices,
+                            crate::sequence::AllocatorObservationPhase::PrefillBefore,
+                            || self.device(),
+                        );
+                    }
                     let start = Instant::now();
                     let raw_logits = self.forward_inputs(inputs, return_raw_logits)?;
                     if mistralrs_quant::serving_observation::enabled() {
@@ -2145,6 +2223,14 @@ pub trait Pipeline:
                         .into_cpu_for_batch(input_seqs.len(), preserve_causal_generation)?;
                     let end = Instant::now();
                     exec_duration += end.duration_since(start);
+                    if is_prompt {
+                        observe_allocator_boundary(
+                            input_seqs,
+                            &seq_indices,
+                            crate::sequence::AllocatorObservationPhase::PrefillAfter,
+                            || self.device(),
+                        );
+                    }
 
                     for (logit_idx, seq_idx) in seq_indices.into_iter().enumerate() {
                         if let ForwardInputsResult::RawLogits { logits } = &raw_logits {
@@ -2685,6 +2771,14 @@ pub trait Pipeline:
                                 .collect::<candle_core::Result<Vec<_>>>()?;
                             hybrid_cache.install_sequence_state_indices(&sequence_slots)?;
                         }
+                        if is_prompt {
+                            observe_allocator_boundary(
+                                input_seqs,
+                                &seq_indices,
+                                crate::sequence::AllocatorObservationPhase::PrefillBefore,
+                                || self.device(),
+                            );
+                        }
                         let start = Instant::now();
                         // Label this synchronous host dispatch for the route counters; the
                         // scope is thread-bound and never crosses an await.
@@ -2722,13 +2816,13 @@ pub trait Pipeline:
                                 !has_suffix_only_prefill && !has_deferred_multimodal_prompt,
                             );
                             for &seq_idx in &seq_indices {
-                                let observation = &mut input_seqs[seq_idx].engine_observation;
                                 if is_prompt {
-                                    observation.prefill_host_forward_sec = Some(
-                                        observation.prefill_host_forward_sec.unwrap_or(0.0)
-                                            + host_forward_sec,
+                                    input_seqs[seq_idx].observe_prefill_host_forward(
+                                        host_forward_sec,
+                                        seq_indices.len() == 1,
                                     );
                                 }
+                                let observation = &mut input_seqs[seq_idx].engine_observation;
                                 crate::serving_observation::populate(observation);
                             }
                         }
@@ -2749,6 +2843,20 @@ pub trait Pipeline:
                         }
                         let end = Instant::now();
                         exec_duration += end.duration_since(start);
+                        observe_allocator_boundary_if(
+                            input_seqs,
+                            &seq_indices,
+                            crate::sequence::AllocatorObservationPhase::PrefillAfter,
+                            |batch_len| {
+                                allocator_final_prompt_chunk(
+                                    is_prompt,
+                                    prompt_chunk.as_ref(),
+                                    &seq_indices,
+                                    batch_len,
+                                )
+                            },
+                            || self.device(),
+                        );
 
                         for (seq_idx, end) in recurrent_boundaries {
                             self.snapshot_paged_recurrent_prefix(
@@ -3136,6 +3244,115 @@ mod tests {
     use candle_core::{Device, DeviceLocation, Tensor};
     use either::Either;
     use indexmap::IndexMap;
+
+    #[test]
+    fn observation_contract_allocator_prompt_selection_and_off_device_getter() {
+        let mut chunk = observation_prompt_chunk(&[(0, 0, 4)]);
+        chunk.is_final_prompt_chunk = false;
+        assert!(!super::allocator_final_prompt_chunk(
+            true,
+            Some(&chunk),
+            &[0],
+            1
+        ));
+        chunk.is_final_prompt_chunk = true;
+        assert!(super::allocator_final_prompt_chunk(
+            true,
+            Some(&chunk),
+            &[0],
+            1
+        ));
+        assert!(!super::allocator_final_prompt_chunk(
+            false,
+            Some(&chunk),
+            &[0],
+            1
+        ));
+        assert!(!super::allocator_final_prompt_chunk(true, None, &[0], 1));
+        assert!(!super::allocator_final_prompt_chunk(
+            true,
+            Some(&chunk),
+            &[1],
+            2
+        ));
+        assert!(!super::allocator_final_prompt_chunk(
+            true,
+            Some(&chunk),
+            &[0, 0],
+            1
+        ));
+        let mut unsupported = crate::sequence::tests::make_observed_test_sequence();
+        unsupported.disable_exact_observation();
+        super::observe_allocator_boundary(
+            &mut [&mut unsupported],
+            &[0],
+            crate::sequence::AllocatorObservationPhase::PrefillBefore,
+            || panic!("unsupported device getter"),
+        );
+        let mut sequences: [&mut crate::sequence::Sequence; 0] = [];
+        super::observe_allocator_boundary(
+            &mut sequences,
+            &[],
+            crate::sequence::AllocatorObservationPhase::PrefillBefore,
+            || panic!("off device getter"),
+        );
+    }
+
+    #[test]
+    fn observation_contract_allocator_final_selector_is_lazy_off_and_after_retention() {
+        use crate::sequence::AllocatorObservationPhase;
+        let mut seq = crate::sequence::tests::make_allocator_observed_test_sequence(false);
+        let phase = AllocatorObservationPhase::PrefillAfter;
+        super::observe_allocator_boundary_if(
+            &mut [&mut seq],
+            &[0],
+            phase,
+            |_| panic!("allocator-off final selector"),
+            || panic!("allocator-off device getter"),
+        );
+        assert!(seq.engine_observation.cuda_allocator.is_none());
+        let mut seq = crate::sequence::tests::make_allocator_observed_test_sequence(true);
+        let mut chunk = observation_prompt_chunk(&[(0, 0, 4)]);
+        chunk.is_final_prompt_chunk = false;
+        super::observe_allocator_boundary_if(
+            &mut [&mut seq],
+            &[0],
+            phase,
+            |batch_len| super::allocator_final_prompt_chunk(true, Some(&chunk), &[0], batch_len),
+            || panic!("nonfinal device getter"),
+        );
+        assert!(seq.engine_observation.cuda_allocator.is_none());
+        chunk.is_final_prompt_chunk = true;
+        super::observe_allocator_boundary_if(
+            &mut [&mut seq],
+            &[0],
+            phase,
+            |batch_len| super::allocator_final_prompt_chunk(true, Some(&chunk), &[0], batch_len),
+            || Device::Cpu,
+        );
+        assert!(seq
+            .engine_observation
+            .cuda_allocator
+            .as_ref()
+            .expect("allocator")
+            .prefill_after
+            .is_some());
+        super::observe_allocator_boundary_if(
+            &mut [&mut seq],
+            &[0],
+            phase,
+            |_| panic!("retained final selector"),
+            || panic!("retained device getter"),
+        );
+        seq.disable_exact_observation();
+        super::observe_allocator_boundary_if(
+            &mut [&mut seq],
+            &[0],
+            AllocatorObservationPhase::PrefillBefore,
+            |_| panic!("disabled final selector"),
+            || panic!("disabled device getter"),
+        );
+    }
 
     fn observation_prompt_chunk(rows: &[(usize, usize, usize)]) -> super::SpeculativePromptChunk {
         super::SpeculativePromptChunk {

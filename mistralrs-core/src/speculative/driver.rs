@@ -96,6 +96,16 @@ fn commit_then_publish_verified_batch<T>(
     publish(target)
 }
 
+fn measure_proposal_dispatch<T>(
+    enabled: bool,
+    single: bool,
+    dispatch: impl FnOnce() -> Result<T>,
+) -> (Result<T>, Option<f64>) {
+    let started = (enabled && single).then(std::time::Instant::now);
+    let result = dispatch();
+    (result, started.map(|start| start.elapsed().as_secs_f64()))
+}
+
 pub trait SpeculativePipelineExt: Pipeline {
     fn has_speculative_proposer(&self) -> bool;
 
@@ -193,7 +203,7 @@ where
     }
 
     for seq in seqs.iter_mut() {
-        seq.disable_exact_observation();
+        seq.begin_speculative_observation();
     }
     let staged_state = staged_batch_state(seqs);
     match staged_state {
@@ -324,6 +334,7 @@ where
         )
         .await?;
         let sampled_token = anchor.token;
+        seq.observe_speculative_token(false);
         finish_or_add_toks_to_seq(target, prefix_cacher, seq, anchor, eos_tok, true).await?;
         if !matches!(seq.getstate(), SequenceState::Done(_)) {
             active_indices.push(idx);
@@ -764,7 +775,7 @@ where
         None
     };
 
-    let proposal_batch = {
+    let (proposal_result, proposal_host_dispatch) = {
         let sequences = active_indices
             .iter()
             .map(|idx| &*seqs[*idx] as &Sequence)
@@ -779,20 +790,34 @@ where
             .lock()
             .expect("speculative autotuner poisoned")
             .begin_step(&seq_ids, proposal_len, started);
-        target.speculative_propose(SpeculativeProposeBatchCtx {
+        let proposer_cache = cache.proposer_cache(&sequences)?;
+        let ctx = SpeculativeProposeBatchCtx {
             proposal_len,
             sampled_tokens,
             sampled_tokens_emitted: true,
             seq_ids: &seq_ids,
             base_lens,
             sequences: &sequences,
-            cache: cache.proposer_cache(&sequences)?,
+            cache: proposer_cache,
             target_hiddens,
             target_rows: &target_rows,
             preparation,
             rng: rng.clone(),
-        })?
+        };
+        measure_proposal_dispatch(
+            mistralrs_quant::serving_observation::enabled(),
+            active_indices.len() == 1,
+            || target.speculative_propose(ctx),
+        )
     };
+    for &idx in active_indices {
+        seqs[idx].observe_speculative_proposal_dispatch(
+            proposal_host_dispatch,
+            active_indices.len() == 1,
+            proposal_result.is_ok(),
+        );
+    }
+    let proposal_batch = proposal_result?;
 
     let Some(proposal_batch) = proposal_batch else {
         target
@@ -855,9 +880,33 @@ mod tests {
 
     use super::{
         commit_then_publish_verified_batch, complete_after_preparation,
-        materialize_prepared_proposals, PreparedVerification,
+        materialize_prepared_proposals, measure_proposal_dispatch, PreparedVerification,
     };
     use crate::speculative::SpeculativeTokens;
+
+    #[test]
+    fn observation_contract_proposal_timer_is_single_call_host_interval() -> candle_core::Result<()>
+    {
+        for (enabled, single) in [(true, true), (true, false), (false, true)] {
+            let calls = Cell::new(0);
+            let (result, duration) = measure_proposal_dispatch(enabled, single, || {
+                calls.set(calls.get() + 1);
+                Ok(17)
+            });
+            assert_eq!(result?, 17);
+            assert_eq!(calls.get(), 1);
+            assert_eq!(duration.is_some(), enabled && single);
+            if let Some(duration) = duration {
+                assert!(duration.is_finite() && duration >= 0.0);
+            }
+        }
+        let (result, duration) = measure_proposal_dispatch(true, true, || {
+            Err::<(), _>(candle_core::Error::msg("dispatch failed"))
+        });
+        assert!(result.is_err());
+        assert!(duration.is_some());
+        Ok(())
+    }
 
     #[test]
     fn materializes_device_proposals_as_one_batch() -> candle_core::Result<()> {
