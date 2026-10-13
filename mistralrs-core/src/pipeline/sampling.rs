@@ -20,6 +20,17 @@ use crate::{
 
 use super::Pipeline;
 
+fn refine_nonstream_tool_call_reason(
+    seq: &mut Sequence,
+    reason: &mut StopReason,
+    has_tool_calls: bool,
+) {
+    if has_tool_calls {
+        *reason = StopReason::ToolCalls;
+        seq.refine_speculative_terminal_reason(reason);
+    }
+}
+
 macro_rules! fixup_sentencepiece {
     ($txt:expr) => {
         $txt.to_string().replace("▁", " ")
@@ -473,6 +484,14 @@ pub(crate) async fn finish_or_add_toks_to_seq(
 
             // Send usage on final chunk.
             let usage_opt = if is_done.is_some() {
+                if seq.allocator_observation_pending(
+                    crate::sequence::AllocatorObservationPhase::Terminal,
+                ) {
+                    seq.observe_cuda_allocator(
+                        crate::sequence::AllocatorObservationPhase::Terminal,
+                        &this.device(),
+                    );
+                }
                 if let Some(reason) = is_done.as_ref() {
                     seq.mark_final_token(reason);
                 }
@@ -492,6 +511,7 @@ pub(crate) async fn finish_or_add_toks_to_seq(
                 .is_err()
             {
                 // If we can't send the response, cancel the sequence
+                seq.mark_speculative_incomplete("canceled");
                 seq.set_state(crate::sequence::SequenceState::Done(
                     crate::sequence::StopReason::Canceled,
                 ));
@@ -509,6 +529,12 @@ pub(crate) async fn finish_or_add_toks_to_seq(
             this.reset_non_granular_state();
         }
     } else if let Some(mut reason) = is_done {
+        if seq.allocator_observation_pending(crate::sequence::AllocatorObservationPhase::Terminal) {
+            seq.observe_cuda_allocator(
+                crate::sequence::AllocatorObservationPhase::Terminal,
+                &this.device(),
+            );
+        }
         seq.mark_final_token(&reason);
         /*
         ***********************
@@ -606,9 +632,7 @@ pub(crate) async fn finish_or_add_toks_to_seq(
                 let tool_calls = parsed.tool_calls;
                 let reasoning_content = parsed.reasoning_content;
 
-                if !tool_calls.is_empty() {
-                    reason = StopReason::ToolCalls;
-                }
+                refine_nonstream_tool_call_reason(seq, &mut reason, !tool_calls.is_empty());
 
                 let choice = crate::Choice {
                     finish_reason: fixup_sentencepiece!(reason),
@@ -1544,7 +1568,7 @@ pub async fn sample_sequence(
         }
     }
 
-    if !sample_speculative {
+    if !sample_speculative && !seq.speculative_observation_active() {
         seq.observe_sampled_token();
     }
     Ok(second_logprobs_response)
@@ -1701,6 +1725,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn observation_contract_speculative_sampling_counts_only_at_actual_append() {
+        let mut ordinary = crate::sequence::tests::make_observed_test_sequence();
+        let mut speculative = crate::sequence::tests::make_observed_test_sequence();
+        speculative.begin_speculative_verification(3);
+        let ordinary_token = sample_test_token(
+            &mut ordinary,
+            Arc::new(std::sync::Mutex::new(Isaac64Rng::seed_from_u64(999))),
+        )
+        .await;
+        let speculative_token = sample_test_token(
+            &mut speculative,
+            Arc::new(std::sync::Mutex::new(Isaac64Rng::seed_from_u64(999))),
+        )
+        .await;
+        assert_eq!(ordinary_token, speculative_token);
+        assert_eq!(ordinary.engine_observation.sampled_tokens, 1);
+        assert_eq!(speculative.engine_observation.sampled_tokens, 0);
+        speculative.observe_speculative_token(true);
+        speculative.add_token(
+            Logprobs {
+                token: speculative_token,
+                logprob: 0.0,
+                bytes: None,
+                top_logprobs: None,
+            },
+            Vec::new(),
+            Some(StopReason::Length(1)),
+        );
+        speculative.mark_final_token(&StopReason::Length(1));
+        speculative.update_time_info();
+        let observation = speculative
+            .get_mut_group()
+            .get_usage()
+            .engine_observation
+            .expect("sampled terminal usage");
+        assert_eq!(observation.sampled_tokens, 1);
+        let counts = observation.speculative.expect("speculative counts");
+        assert_eq!(counts.accepted_draft_tokens, 1);
+        assert_eq!(counts.committed_draft_tokens, 1);
+        assert_eq!(counts.committed_output_tokens, 1);
+        assert!(counts.measurement_complete);
+    }
+
+    #[tokio::test]
     async fn seeded_sampling_is_independent_of_sequence_order() {
         let fallback = || Arc::new(std::sync::Mutex::new(Isaac64Rng::seed_from_u64(999)));
         let (mut first_a, mut first_b) =
@@ -1762,6 +1830,79 @@ mod tests {
                 parameters: None,
                 strict: None,
             },
+        }
+    }
+
+    #[test]
+    fn observation_contract_nonstream_tool_refinement_preserves_legacy_stop_observation() {
+        let raw = r#"<tool_call>{"name":"get_weather","arguments":{"city":"Paris"}}</tool_call>"#;
+        for speculative_enabled in [false, true] {
+            let mut seq = crate::sequence::tests::make_observed_test_sequence();
+            seq.observation_causal = true;
+            if speculative_enabled {
+                seq.begin_speculative_verification(3);
+                seq.observe_speculative_token(true);
+            } else {
+                seq.observe_sampled_token();
+            }
+            let mut reason = StopReason::Length(1);
+            seq.add_token(
+                Logprobs {
+                    token: 9,
+                    logprob: 0.0,
+                    bytes: None,
+                    top_logprobs: None,
+                },
+                raw.as_bytes().to_vec(),
+                Some(reason),
+            );
+            seq.mark_final_token(&reason);
+            seq.set_state(SequenceState::Done(reason));
+            let mut legacy_before =
+                serde_json::to_value(&seq.engine_observation).expect("original observation");
+            legacy_before
+                .as_object_mut()
+                .expect("observation object")
+                .remove("speculative");
+            let tool = weather_tool();
+            let mut parser =
+                ToolCallState::new(ToolChoice::Auto, Some(&[tool]), None).expect("tool parser");
+            let parsed = parser
+                .finalize_for_response(raw, None, None, None)
+                .expect("final tool parse");
+            assert_eq!(parsed.tool_calls.len(), 1);
+            refine_nonstream_tool_call_reason(&mut seq, &mut reason, !parsed.tool_calls.is_empty());
+            seq.add_choice_to_group(crate::Choice {
+                finish_reason: reason.to_string(),
+                stop_sequence: None,
+                index: seq.get_response_index(),
+                message: crate::ResponseMessage {
+                    content: parsed.content,
+                    role: "assistant".into(),
+                    tool_calls: Some(parsed.tool_calls),
+                    reasoning_content: parsed.reasoning_content,
+                },
+                logprobs: None,
+            });
+            let group = seq.get_mut_group();
+            assert_eq!(group.get_choices()[0].finish_reason, "tool_calls");
+            let observation = group.get_usage().engine_observation.expect("refined usage");
+            assert_eq!(observation.finish_reason.as_deref(), Some("length"));
+            let mut legacy_after = serde_json::to_value(&observation).expect("refined observation");
+            legacy_after
+                .as_object_mut()
+                .expect("observation object")
+                .remove("speculative");
+            assert_eq!(legacy_before, legacy_after);
+            if speculative_enabled {
+                let speculative = observation.speculative.expect("speculative terminal");
+                assert_eq!(speculative.terminal_reason.as_deref(), Some("tool_calls"));
+                assert!(speculative.measurement_complete);
+                assert_eq!(speculative.committed_output_tokens, 1);
+                assert_eq!(speculative.committed_draft_tokens, 1);
+            } else {
+                assert!(observation.speculative.is_none());
+            }
         }
     }
 

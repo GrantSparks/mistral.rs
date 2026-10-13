@@ -141,3 +141,58 @@ Throughput gain depends on how many proposed tokens the target accepts and on th
 MTP supports batched generation and constrained decoding.
 
 MTP is configured at launch time only (CLI flags, `Runner(...)`, or the model builder). There is no per-request HTTP field to toggle it; load the server with the assistant attached and every request uses it.
+
+## Request observations
+
+When inference observations are enabled (`MISTRALRS_INFERENCE_OBSERVATIONS`), the existing
+`Usage.engine_observation` on single-choice causal requests can include an optional
+`speculative` block. The Rust SDK exports `EngineObservation` and `SpeculativeObservation`.
+Observation-disabled requests omit engine observations. Ordinary observations omit the
+`speculative` field and retain their existing JSON representation. Multiple-choice requests
+and genuinely unsupported paths do not publish an engine observation, even if an error
+later reduces the number of live choices to one.
+
+The counters describe actual source events:
+
+| Field | Scope and boundary |
+| --- | --- |
+| `verification_steps` | Acceptance passes entered, including a final pass interrupted by a stop, cancellation or error. This is not a count of completed target forwards. |
+| `proposed_draft_tokens` | Whole proposal rows entering those passes; excludes anchors and target continuations. Proposals staged without entering an acceptance pass are excluded. |
+| `accepted_draft_tokens` | Inspected target-comparison decisions that accept a draft, before decoding and append. A later append failure can leave this larger than `committed_draft_tokens`. |
+| `committed_output_tokens` | Actual output tokens appended to the sequence during the whole request, including ordinary tokens preceding speculative entry, anchors, target continuations, EOS, stop tokens and nonvisible output. |
+| `committed_draft_tokens` | Accepted drafts actually appended after speculative observation begins. Rejected drafts and uninspected proposals after a stop or length limit are excluded. |
+| `measurement_complete` | The observed counters cover the terminal committed output boundary. This does not attest later speculative state or cache commit, successful delivery to a disconnected client, numerical equivalence, or complete inspection of every proposal. |
+| `terminal_reason` | Known output boundary or interruption: `eos`, `stop_token`, `stop_string`, `max_output_tokens`, `model_length`, `tool_calls`, `canceled` or `error`. An unfinished snapshot can have no reason. |
+
+Counters and timestamps are updated before terminal Usage publication. The final verification
+step is included even though the driver receives its verification result afterward. EOS,
+hidden stop bytes and the final allowed output token count when appended; the remaining
+proposal tail does not count as committed output. Available canceled/error snapshots are
+partial (`measurement_complete: false`). A closed sender can drop the response; the engine
+does not manufacture a final Usage response in that case.
+
+Use the validity flags inside the block before interpreting legacy fields:
+
+| Flag | Meaning when true |
+| --- | --- |
+| `cache_fields_valid` | Existing optional cache facts came from direct prefix lookup, restore or final reuse events. Individual `None` fields remain unknown. The reused prefix is recorded after source replay/clip decisions, not inferred from a candidate hit. |
+| `prefill_geometry_valid` | Successful prompt forwards supplied exact sequence query ranges for the existing `prefill_chunk_count` and `prefill_chunk_max_tokens`. Unsupported or ambiguous geometry stays unknown. |
+| `prefill_host_forward_sec_valid` | Every contributing prompt host-forward interval belonged to a single sequence. Any shared dispatch makes the request total permanently unknown. |
+| `token_markers_valid` | First/last token timestamps use the sequence clock immediately after actual append. If ordinary sampler-boundary timestamps preceded speculative entry, the combined markers are unknown even though committed token counts remain known. |
+
+`raw_prompt_sec_valid` and `raw_completion_sec_valid` are currently false for speculative
+requests: the old phase totals are not exact speculative request timing. Missing validity
+flags deserialize as false. Do not turn unknown timing or cache facts into zero durations,
+cache misses or exact throughput.
+
+`proposal_host_dispatch_sec` is the sum of actual single-sequence `speculative_propose`
+call-to-return host intervals. It excludes planning, cache lookup, target-hidden preparation,
+`speculative_prepare_propose` and subsequent staging. It does not synchronize the GPU or
+measure device completion. Shared batches, failed calls or unavailable intervals permanently
+invalidate the total. `proposal_host_dispatch_unavailable` distinguishes `no_proposal_dispatch`,
+`shared_batch`, `proposal_dispatch_failed` and `interval_unavailable`.
+
+`verification_host_dispatch_sec` is currently unknown, with
+`verification_host_dispatch_unavailable: "target_forward_interval_unavailable"`. The target
+forward and token acceptance cross existing dispatch boundaries, so the engine does not
+reuse a batch interval or divide shared time between requests to populate this field.

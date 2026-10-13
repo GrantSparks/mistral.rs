@@ -10,6 +10,10 @@ pub(crate) mod tokens;
 pub(crate) mod unvarbuilder;
 pub(crate) mod varbuilder_utils;
 
+pub(crate) fn prepare_pipeline_error_observation(seq: &mut crate::sequence::Sequence) {
+    seq.mark_speculative_incomplete("error");
+}
+
 #[doc(hidden)]
 #[macro_export]
 macro_rules! get_mut_arcmutex {
@@ -139,11 +143,16 @@ macro_rules! handle_pipeline_forward_error {
                     }
                 }
 
-                let (tokenizer, pipeline_name) = {
+                let (tokenizer, pipeline_name, allocator_device) = {
                     let pipeline = get_mut_arcmutex!($pipeline);
                     let pipeline_name = pipeline.name();
                     let tokenizer = pipeline.tokenizer();
-                    (tokenizer, pipeline_name)
+                    let allocator_device = if $seq_slice.iter_mut().any(|seq| seq.allocator_observation_pending($crate::sequence::AllocatorObservationPhase::Terminal)) {
+                        Some(pipeline.device())
+                    } else {
+                        None
+                    };
+                    (tokenizer, pipeline_name, allocator_device)
                 };
                 use $crate::response::Response;
                 use $crate::sequence::SequenceState;
@@ -161,6 +170,10 @@ macro_rules! handle_pipeline_forward_error {
                         None => "".to_string(),
                     };
 
+                    if let Some(device) = allocator_device.as_ref() {
+                        seq.observe_cuda_allocator($crate::sequence::AllocatorObservationPhase::Terminal, device);
+                    }
+                    $crate::utils::prepare_pipeline_error_observation(seq);
                     if seq.get_mut_group().is_chat {
                         let choice = Choice {
                             finish_reason: "error".to_string(),
@@ -314,4 +327,124 @@ pub const fn using_flash_attn() -> bool {
 #[cfg(any(feature = "flash-attn", feature = "flash-attn-v3"))]
 pub const fn using_flash_attn() -> bool {
     true
+}
+
+#[cfg(test)]
+mod observation_contract_tests {
+    use crate::{
+        sampler::Logprobs,
+        sequence::{SequenceState, StopReason},
+    };
+
+    #[test]
+    fn observation_contract_pipeline_error_usage_is_partial_before_error_state() {
+        for is_chat in [true, false] {
+            for reason in [StopReason::Eos, StopReason::Length(1)] {
+                let mut seq = crate::sequence::tests::make_observed_test_sequence();
+                seq.get_mut_group().is_chat = is_chat;
+                seq.begin_speculative_verification(7);
+                seq.observe_speculative_token(true);
+                seq.add_token(
+                    Logprobs {
+                        token: 9,
+                        logprob: 0.0,
+                        bytes: None,
+                        top_logprobs: None,
+                    },
+                    b"partial".to_vec(),
+                    Some(reason),
+                );
+                seq.mark_final_token(&reason);
+                seq.set_state(SequenceState::Done(reason));
+                assert!(
+                    seq.engine_observation
+                        .speculative
+                        .as_ref()
+                        .expect("prior terminal")
+                        .measurement_complete
+                );
+                super::prepare_pipeline_error_observation(&mut seq);
+                if is_chat {
+                    seq.add_choice_to_group(crate::Choice {
+                        finish_reason: "error".into(),
+                        stop_sequence: None,
+                        index: 0,
+                        message: crate::ResponseMessage {
+                            content: Some("partial".into()),
+                            role: "assistant".into(),
+                            tool_calls: None,
+                            reasoning_content: None,
+                        },
+                        logprobs: None,
+                    });
+                } else {
+                    seq.add_completion_choice_to_group(crate::CompletionChoice {
+                        finish_reason: "error".into(),
+                        index: 0,
+                        text: "partial".into(),
+                        logprobs: None,
+                    });
+                }
+                assert_eq!(seq.getstate(), SequenceState::Done(reason));
+                let group = seq.get_mut_group();
+                let usage = group.get_usage();
+                if is_chat {
+                    assert_eq!(group.get_choices()[0].finish_reason, "error");
+                } else {
+                    assert_eq!(group.get_completion_choices()[0].finish_reason, "error");
+                }
+                let observation = usage
+                    .engine_observation
+                    .expect("published error observation");
+                let speculative = observation
+                    .speculative
+                    .expect("published speculative error");
+                assert!(!speculative.measurement_complete);
+                assert_eq!(speculative.terminal_reason.as_deref(), Some("error"));
+                assert_eq!(speculative.verification_steps, 1);
+                assert_eq!(speculative.proposed_draft_tokens, 7);
+                assert_eq!(speculative.accepted_draft_tokens, 1);
+                assert_eq!(speculative.committed_draft_tokens, 1);
+                assert_eq!(speculative.committed_output_tokens, 1);
+                assert_eq!(
+                    observation.finish_reason.as_deref(),
+                    Some(reason.to_string().as_str())
+                );
+                drop(group);
+                seq.set_state(SequenceState::Error);
+                assert_eq!(seq.getstate(), SequenceState::Error);
+            }
+        }
+    }
+
+    #[test]
+    fn observation_contract_pipeline_error_observer_preserves_ordinary_and_unsupported_usage() {
+        for unsupported in [false, true] {
+            let mut seq = crate::sequence::tests::make_observed_test_sequence();
+            seq.observation_causal = true;
+            seq.observe_sampled_token();
+            seq.add_token(
+                Logprobs {
+                    token: 9,
+                    logprob: 0.0,
+                    bytes: None,
+                    top_logprobs: None,
+                },
+                b"ordinary".to_vec(),
+                Some(StopReason::Length(1)),
+            );
+            seq.mark_final_token(&StopReason::Length(1));
+            if unsupported {
+                seq.disable_exact_observation();
+            }
+            seq.update_time_info();
+            let before =
+                serde_json::to_string(&seq.get_mut_group().get_usage()).expect("ordinary usage");
+            super::prepare_pipeline_error_observation(&mut seq);
+            let after = serde_json::to_string(&seq.get_mut_group().get_usage())
+                .expect("prepared ordinary usage");
+            assert_eq!(before, after);
+            assert!(seq.engine_observation.speculative.is_none());
+        }
+    }
 }

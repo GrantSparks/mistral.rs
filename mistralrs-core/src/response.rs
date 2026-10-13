@@ -15,9 +15,132 @@ use crate::{sampler::TopLogprob, tools::ToolCallResponse};
 #[cfg_attr(feature = "pyo3_macros", pyo3(get_all))]
 #[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
 #[serde(default)]
+/// At most four device-scoped allocator queries at fixed source boundaries.
+pub struct CudaAllocatorObservation {
+    pub pipeline_begin: Option<CudaAllocatorSample>,
+    pub prefill_before: Option<CudaAllocatorSample>,
+    pub prefill_after: Option<CudaAllocatorSample>,
+    pub terminal: Option<CudaAllocatorSample>,
+}
+
+#[cfg_attr(feature = "pyo3_macros", pyclass)]
+#[cfg_attr(feature = "pyo3_macros", pyo3(get_all))]
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
+/// Host query bracket; neither a GPU completion fence nor a request memory peak.
+pub struct CudaAllocatorSample {
+    pub phase: String,
+    pub scope: String,
+    pub cuda_device_ordinal: Option<usize>,
+    pub query_start_sequence_elapsed_ns: u64,
+    pub query_end_sequence_elapsed_ns: u64,
+    pub total_bytes: Option<usize>,
+    pub free_bytes: Option<usize>,
+    pub async_pool: Option<CudaAllocatorPoolObservation>,
+    pub graph_pool: Option<CudaAllocatorGraphObservation>,
+    pub unavailable: Option<String>,
+}
+
+#[cfg_attr(feature = "pyo3_macros", pyclass)]
+#[cfg_attr(feature = "pyo3_macros", pyo3(get_all))]
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
+/// Device async allocator state; highwaters are cumulative and never reset here.
+pub struct CudaAllocatorPoolObservation {
+    pub used_bytes: usize,
+    pub reserved_bytes: usize,
+    pub used_high_bytes: usize,
+    pub reserved_high_bytes: usize,
+    pub release_threshold_bytes: usize,
+}
+
+#[cfg_attr(feature = "pyo3_macros", pyclass)]
+#[cfg_attr(feature = "pyo3_macros", pyo3(get_all))]
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
+/// Device graph allocator state, separate from the async pool.
+pub struct CudaAllocatorGraphObservation {
+    pub used_bytes: usize,
+    pub reserved_bytes: usize,
+    pub used_high_bytes: usize,
+    pub reserved_high_bytes: usize,
+}
+
+#[cfg_attr(feature = "pyo3_macros", pyclass)]
+#[cfg_attr(feature = "pyo3_macros", pyo3(get_all))]
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
+#[serde(default)]
+/// Request-local speculative counters at the committed output boundary, independent of cache commit.
+pub struct SpeculativeObservation {
+    /// Acceptance passes entered, including a final pass interrupted by a stop or failure.
+    pub verification_steps: usize,
+    /// Whole proposals submitted to those passes, excluding anchors and continuations.
+    pub proposed_draft_tokens: usize,
+    /// Inspected target-comparison decisions accepting a draft, before token append.
+    pub accepted_draft_tokens: usize,
+    /// Actual whole-request output appends, including ordinary tokens, EOS, stops and hidden tokens.
+    pub committed_output_tokens: usize,
+    /// Accepted drafts actually appended after speculative observation began.
+    pub committed_draft_tokens: usize,
+    /// Counters cover the emitted terminal output boundary; this does not attest cache commit.
+    pub measurement_complete: bool,
+    pub terminal_reason: Option<String>,
+    /// Sum of single-sequence proposer call-to-return host intervals, without GPU synchronization.
+    pub proposal_host_dispatch_sec: Option<f64>,
+    pub proposal_host_dispatch_unavailable: Option<String>,
+    pub verification_host_dispatch_sec: Option<f64>,
+    pub verification_host_dispatch_unavailable: Option<String>,
+    pub raw_prompt_sec_valid: bool,
+    pub raw_completion_sec_valid: bool,
+    /// Existing optional cache facts came from direct source events; individual None fields remain unknown.
+    pub cache_fields_valid: bool,
+    pub prefill_geometry_valid: bool,
+    pub prefill_host_forward_sec_valid: bool,
+    /// All token timestamps use the post-append boundary, with no earlier sampler-boundary markers.
+    pub token_markers_valid: bool,
+}
+
+impl SpeculativeObservation {
+    pub(crate) fn proposal_dispatch(
+        &mut self,
+        duration: Option<f64>,
+        single: bool,
+        successful: bool,
+    ) {
+        if matches!(
+            self.proposal_host_dispatch_unavailable.as_deref(),
+            Some("shared_batch" | "proposal_dispatch_failed" | "interval_unavailable")
+        ) {
+            return;
+        }
+        let unavailable = if !single {
+            Some("shared_batch")
+        } else if !successful {
+            Some("proposal_dispatch_failed")
+        } else if duration.is_none() {
+            Some("interval_unavailable")
+        } else {
+            None
+        };
+        if let Some(reason) = unavailable {
+            self.proposal_host_dispatch_sec = None;
+            self.proposal_host_dispatch_unavailable = Some(reason.into());
+        } else if let Some(duration) = duration {
+            self.proposal_host_dispatch_sec =
+                Some(self.proposal_host_dispatch_sec.unwrap_or(0.0) + duration);
+            self.proposal_host_dispatch_unavailable = None;
+        }
+    }
+}
+
+#[cfg_attr(feature = "pyo3_macros", pyclass)]
+#[cfg_attr(feature = "pyo3_macros", pyo3(get_all))]
+#[derive(Debug, Clone, Default, Serialize, serde::Deserialize)]
+#[serde(default)]
 /// Sequence-local causal output markers and explicitly worker-wide dispatch counters.
-/// Accepted output includes EOS, stop and nonvisible tokens; rejected candidates and drafts are excluded.
+/// Accepted output includes EOS, stop and nonvisible tokens; speculative drafts count only after append.
 pub struct EngineObservation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cuda_allocator: Option<CudaAllocatorObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speculative: Option<SpeculativeObservation>,
     pub sequence_id: usize,
     pub clock_origin: String,
     pub clock_anchor_unavailable: String,
@@ -725,6 +848,116 @@ impl Response {
 #[cfg(test)]
 mod observation_contract_tests {
     use super::*;
+
+    #[test]
+    fn observation_contract_allocator_required_metrics_and_brackets_never_default_to_zero() {
+        for incomplete in [
+            r#"{"used_bytes":0,"reserved_bytes":0,"used_high_bytes":0,"reserved_high_bytes":0}"#,
+            r#"{}"#,
+        ] {
+            assert!(serde_json::from_str::<CudaAllocatorPoolObservation>(incomplete).is_err());
+        }
+        assert!(
+            serde_json::from_str::<CudaAllocatorGraphObservation>(r#"{"used_bytes":0}"#).is_err()
+        );
+        let sample = CudaAllocatorSample {
+            phase: "PipelineBegin".into(),
+            scope: "primary_device".into(),
+            async_pool: Some(CudaAllocatorPoolObservation::default()),
+            graph_pool: Some(CudaAllocatorGraphObservation::default()),
+            total_bytes: Some(0),
+            free_bytes: Some(0),
+            ..Default::default()
+        };
+        let encoded = serde_json::to_value(&sample).expect("sample JSON");
+        let decoded: CudaAllocatorSample =
+            serde_json::from_value(encoded.clone()).expect("explicit zeros");
+        assert_eq!(decoded.total_bytes, Some(0));
+        assert_eq!(decoded.async_pool.expect("pool").used_high_bytes, 0);
+        assert_eq!(decoded.graph_pool.expect("graph").reserved_high_bytes, 0);
+        for required in [
+            "phase",
+            "scope",
+            "query_start_sequence_elapsed_ns",
+            "query_end_sequence_elapsed_ns",
+        ] {
+            let mut incomplete = encoded.clone();
+            incomplete.as_object_mut().expect("object").remove(required);
+            assert!(serde_json::from_value::<CudaAllocatorSample>(incomplete).is_err());
+        }
+        let old: EngineObservation = serde_json::from_str("{}").expect("legacy");
+        assert!(old.cuda_allocator.is_none());
+    }
+
+    #[test]
+    fn observation_contract_ordinary_observation_keeps_legacy_json_bytes() {
+        let legacy = concat!(
+            r#"{"sequence_id":0,"clock_origin":"","clock_anchor_unavailable":"","sequence_origin_utc_unix_ns":null,"sequence_origin_uncertainty_ns":null,"activation_dtype":null,"kv_dtype":null,"paged_block_size":null,"worker_graph_capture_attempts":0,"worker_graph_capture_successes":0,"worker_graph_failures":0,"worker_graph_replays":0,"worker_graph_eligible":0,"worker_graph_eager_reason":"","graph_requested":false,"graph_counter_scope":"","build_cuda":false,"build_flash_attn":false,"build_metal":false,"worker_gdn_fused_decode":0,"token_count_convention":"","worker_fp8_native_prefill":0,"worker_fp8_native_decode":0,"worker_fp8_native_unknown":0,"worker_fp8_dequant_prefill":0,"worker_fp8_dequant_decode":0,"worker_fp8_dequant_unknown":0,"worker_unquant_gemv_prefill":0,"worker_unquant_gemv_decode":0,"worker_unquant_gemv_unknown":0,"worker_unquant_matmul_prefill":0,"worker_unquant_matmul_decode":0,"worker_unquant_matmul_unknown":0,"worker_gdn_fused_decode_prefill":0,"worker_gdn_fused_decode_decode":0,"worker_gdn_fused_decode_unknown":0,"worker_fp8_native":0,"worker_fp8_dequant":0,"worker_unquant_gemv":0,"worker_unquant_matmul":0,"kernel_counter_scope":"","response_index":0,"prompt_tokens":0,"candidate_prefix_tokens":null,"recurrent_restored_tokens":null,"reused_prefix_tokens":null,"uncached_suffix_tokens":null,"cache_outcome":null,"recurrent_outcome":null,"prefix_lookup_sec":null,"recurrent_lookup_sec":null,"recurrent_restore_sec":null,"snapshot_host_bytes":null,"snapshot_entries":null,"snapshot_capacity_bytes":null,"snapshot_placement":null,"snapshot_write_count":null,"snapshot_write_bytes":null,"snapshot_evicted_entries":null,"snapshot_evicted_bytes":null,"snapshot_host_copy_ns":null,"snapshot_write_measurement_complete":null,"prefill_chunk_count":null,"prefill_chunk_max_tokens":null,"prefill_host_forward_sec":null,"first_token_sequence_elapsed_ns":null,"last_token_sequence_elapsed_ns":null,"sampled_tokens":0,"final_token_marker":false,"finish_reason":null,"token_marker_boundary":"","kernel_phase_unavailable":"","raw_prompt_sec":0.0,"raw_completion_sec":0.0}"#,
+        );
+        assert_eq!(
+            serde_json::to_string(&EngineObservation::default()).expect("ordinary observation"),
+            legacy
+        );
+        let decoded: EngineObservation = serde_json::from_str(legacy).expect("legacy observation");
+        assert!(decoded.speculative.is_none());
+    }
+
+    #[test]
+    fn observation_contract_speculative_roundtrip_and_missing_validity_are_conservative() {
+        let legacy: EngineObservation =
+            serde_json::from_str(r#"{"speculative":{}}"#).expect("partial observation");
+        let speculative = legacy.speculative.expect("explicit speculative block");
+        assert!(!speculative.measurement_complete);
+        assert!(!speculative.raw_prompt_sec_valid);
+        assert!(!speculative.raw_completion_sec_valid);
+        assert!(!speculative.cache_fields_valid);
+        assert!(!speculative.prefill_geometry_valid);
+        assert!(!speculative.prefill_host_forward_sec_valid);
+        assert!(!speculative.token_markers_valid);
+        assert!(speculative.proposal_host_dispatch_sec.is_none());
+        assert!(speculative.verification_host_dispatch_sec.is_none());
+        let observed = EngineObservation {
+            speculative: Some(SpeculativeObservation {
+                verification_steps: 2,
+                proposed_draft_tokens: 10,
+                accepted_draft_tokens: 2,
+                committed_output_tokens: 4,
+                committed_draft_tokens: 2,
+                measurement_complete: true,
+                terminal_reason: Some("max_output_tokens".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let encoded = serde_json::to_string(&observed).expect("speculative observation");
+        let decoded: EngineObservation =
+            serde_json::from_str(&encoded).expect("speculative roundtrip");
+        assert_eq!(
+            serde_json::to_string(&decoded).expect("roundtrip serialization"),
+            encoded
+        );
+    }
+
+    #[test]
+    fn observation_contract_proposal_host_total_is_permanently_unknown_after_shared_or_failed_call()
+    {
+        for (single, successful, reason) in [
+            (false, true, "shared_batch"),
+            (true, false, "proposal_dispatch_failed"),
+        ] {
+            let mut observed = SpeculativeObservation::default();
+            observed.proposal_dispatch(Some(0.5), true, true);
+            observed.proposal_dispatch(Some(0.25), true, true);
+            assert_eq!(observed.proposal_host_dispatch_sec, Some(0.75));
+            observed.proposal_dispatch(Some(1.0), single, successful);
+            observed.proposal_dispatch(Some(0.5), true, true);
+            assert_eq!(observed.proposal_host_dispatch_sec, None);
+            assert_eq!(
+                observed.proposal_host_dispatch_unavailable.as_deref(),
+                Some(reason)
+            );
+        }
+    }
 
     #[test]
     fn observation_contract_token_markers_include_terminal_sample() {
