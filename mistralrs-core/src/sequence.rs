@@ -754,6 +754,7 @@ pub struct Sequence {
     observation_start: Option<Instant>,
     pub(crate) observation_causal: bool,
     observation_supported: bool,
+    prefill_geometry_invalid: bool,
     // Metadata, const
     id: usize,
     prompt_len: usize,
@@ -907,6 +908,7 @@ impl Sequence {
             observation_start: observation_clock.map(|clock| clock.origin),
             observation_causal: false,
             observation_supported: true,
+            prefill_geometry_invalid: false,
             engine_observation: if mistralrs_quant::serving_observation::enabled() {
                 crate::EngineObservation {
                     sequence_id: id,
@@ -1325,9 +1327,36 @@ impl Sequence {
         self.engine_observation.prompt_tokens = self.prompt_len;
         self.engine_observation
             .final_prefix(self.prompt_len, self.prefix_cache_len);
-        if self.engine_observation.prefill_chunk_count == Some(1) {
-            self.engine_observation.prefill_chunk_max_tokens =
-                Some(self.prompt_len.saturating_sub(self.prefix_cache_len));
+    }
+
+    pub(crate) fn observe_prefill_forward(&mut self, query_tokens: Option<usize>) {
+        if self.observation_start.is_none() || !self.observation_supported {
+            return;
+        }
+        if self.prefill_geometry_invalid {
+            return;
+        }
+        let next = query_tokens
+            .filter(|&tokens| tokens > 0)
+            .and_then(|tokens| {
+                self.engine_observation
+                    .prefill_chunk_count
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .map(|count| (count, tokens))
+            });
+        if let Some((count, tokens)) = next {
+            self.engine_observation.prefill_chunk_count = Some(count);
+            self.engine_observation.prefill_chunk_max_tokens = Some(
+                self.engine_observation
+                    .prefill_chunk_max_tokens
+                    .unwrap_or(0)
+                    .max(tokens),
+            );
+        } else {
+            self.prefill_geometry_invalid = true;
+            self.engine_observation.prefill_chunk_count = None;
+            self.engine_observation.prefill_chunk_max_tokens = None;
         }
     }
 
@@ -2713,7 +2742,7 @@ impl SequenceGroup {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::tools::{
         state::required_tool_call_deadline_tokens, ToolCallFormat, ToolCallState, ToolChoice,
@@ -2910,11 +2939,71 @@ mod tests {
         seq.set_prefix_cache_len(4);
         assert_eq!(seq.engine_observation.reused_prefix_tokens, Some(4));
         assert_eq!(seq.engine_observation.uncached_suffix_tokens, Some(4));
-        seq.engine_observation.prefill_chunk_count = Some(1);
+        seq.observe_prefill_forward(Some(4));
         seq.set_prefix_cache_len(0);
         assert_eq!(seq.engine_observation.reused_prefix_tokens, Some(0));
         assert_eq!(seq.engine_observation.uncached_suffix_tokens, Some(8));
-        assert_eq!(seq.engine_observation.prefill_chunk_max_tokens, Some(8));
+        assert_eq!(seq.engine_observation.prefill_chunk_count, Some(1));
+        assert_eq!(seq.engine_observation.prefill_chunk_max_tokens, Some(4));
+    }
+
+    #[test]
+    fn observation_contract_prefill_geometry_accumulates_across_scheduler_steps() {
+        let mut seq = make_observed_test_sequence();
+        assert_eq!(seq.engine_observation.prefill_chunk_count, None);
+        assert_eq!(seq.engine_observation.prefill_chunk_max_tokens, None);
+        for tokens in [128, 128, 6] {
+            seq.observe_prefill_forward(Some(tokens));
+        }
+        assert_eq!(seq.engine_observation.prefill_chunk_count, Some(3));
+        assert_eq!(seq.engine_observation.prefill_chunk_max_tokens, Some(128));
+        seq.set_prefix_cache_len(4);
+        seq.set_prefix_cache_len(0);
+        assert_eq!(seq.engine_observation.prefill_chunk_count, Some(3));
+        assert_eq!(seq.engine_observation.prefill_chunk_max_tokens, Some(128));
+    }
+
+    #[test]
+    fn observation_contract_prefill_geometry_unknown_is_sticky() {
+        for invalid in [None, Some(0)] {
+            let mut seq = make_observed_test_sequence();
+            seq.observe_prefill_forward(Some(4));
+            seq.observe_prefill_forward(invalid);
+            seq.set_prefix_cache_len(0);
+            seq.observe_prefill_forward(Some(8));
+            assert_eq!(seq.engine_observation.prefill_chunk_count, None);
+            assert_eq!(seq.engine_observation.prefill_chunk_max_tokens, None);
+        }
+    }
+
+    #[test]
+    fn observation_contract_prefill_geometry_count_overflow_is_unknown() {
+        let mut seq = make_observed_test_sequence();
+        seq.engine_observation.prefill_chunk_count = Some(usize::MAX);
+        seq.engine_observation.prefill_chunk_max_tokens = Some(4);
+        seq.observe_prefill_forward(Some(8));
+        seq.observe_prefill_forward(Some(8));
+        assert_eq!(seq.engine_observation.prefill_chunk_count, None);
+        assert_eq!(seq.engine_observation.prefill_chunk_max_tokens, None);
+    }
+
+    #[test]
+    fn observation_contract_prefill_geometry_unobserved_and_unsupported_stay_unknown() {
+        let mut unobserved = make_observed_test_sequence();
+        unobserved.observation_start = None;
+        unobserved.observe_prefill_forward(Some(8));
+        unobserved.observe_prefill_forward(None);
+        assert!(!unobserved.prefill_geometry_invalid);
+        assert_eq!(unobserved.engine_observation.prefill_chunk_count, None);
+        assert_eq!(unobserved.engine_observation.prefill_chunk_max_tokens, None);
+        let mut unsupported = make_observed_test_sequence();
+        unsupported.disable_exact_observation();
+        unsupported.observe_prefill_forward(Some(8));
+        assert_eq!(unsupported.engine_observation.prefill_chunk_count, None);
+        assert_eq!(
+            unsupported.engine_observation.prefill_chunk_max_tokens,
+            None
+        );
     }
 
     fn make_test_sequence_with_seed(seed: Option<u64>) -> Sequence {
@@ -2923,8 +3012,21 @@ mod tests {
 
     /// Observation tests report usage through `update_time_info`, whose length
     /// accounting reads the first layer cache, so they need a layer.
-    fn make_observed_test_sequence() -> Sequence {
+    pub(crate) fn make_observed_test_sequence() -> Sequence {
         make_test_sequence_with_layers_and_seed(1, None)
+    }
+
+    pub(crate) fn make_observed_deferred_media_test_sequence() -> Sequence {
+        let mut seq = make_observed_test_sequence();
+        seq.multimodal = MultimodalData::new(
+            Some(vec![image::DynamicImage::new_rgb8(1, 1)]),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        seq
     }
 
     fn make_test_sequence_with_layers_and_seed(layers: usize, seed: Option<u64>) -> Sequence {

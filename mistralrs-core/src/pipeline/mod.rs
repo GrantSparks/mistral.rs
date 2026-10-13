@@ -1692,6 +1692,59 @@ pub struct SpeculativePromptChunk {
     pub is_final_prompt_chunk: bool,
 }
 
+fn observed_prefill_query_tokens(
+    seq_idx: usize,
+    batch_len: usize,
+    seq_indices: &[usize],
+    prompt_chunk: Option<&SpeculativePromptChunk>,
+) -> Option<usize> {
+    let rows = &prompt_chunk?.rows;
+    if rows.len() != seq_indices.len()
+        || seq_indices
+            .iter()
+            .enumerate()
+            .any(|(i, &idx)| idx >= batch_len || seq_indices[..i].contains(&idx))
+        || rows.iter().enumerate().any(|(i, row)| {
+            row.seq_idx >= batch_len
+                || !seq_indices.contains(&row.seq_idx)
+                || rows[..i].iter().any(|prior| prior.seq_idx == row.seq_idx)
+        })
+    {
+        return None;
+    }
+    let row = rows.iter().find(|row| row.seq_idx == seq_idx)?;
+    if row.range.1 > row.tokens.len() {
+        return None;
+    }
+    row.range.1.checked_sub(row.range.0).filter(|&len| len > 0)
+}
+
+fn observe_successful_prefill_forward(
+    input_seqs: &mut [&mut Sequence],
+    is_prompt: bool,
+    seq_indices: &[usize],
+    prompt_chunk: Option<&SpeculativePromptChunk>,
+    geometry_supported: bool,
+) {
+    if !is_prompt {
+        return;
+    }
+    let batch_len = input_seqs.len();
+    for (seq_idx, seq) in input_seqs.iter_mut().enumerate() {
+        // Ambiguous remapping also invalidates rows omitted from the processed index set.
+        if seq_indices.contains(&seq_idx)
+            || prompt_chunk.is_some_and(|chunk| chunk.rows.iter().any(|row| row.seq_idx == seq_idx))
+        {
+            let query_tokens = if geometry_supported {
+                observed_prefill_query_tokens(seq_idx, batch_len, seq_indices, prompt_chunk)
+            } else {
+                None
+            };
+            seq.observe_prefill_forward(query_tokens);
+        }
+    }
+}
+
 fn should_sample_step(
     is_prompt: bool,
     scheduler_visible_prompt_step: bool,
@@ -2078,8 +2131,17 @@ pub trait Pipeline:
                             && sampling::can_sample_batch_cuda(input_seqs))
                             || crate::speculative::verifier::can_batch_device_verify(input_seqs));
                     let start = Instant::now();
-                    let raw_logits = self
-                        .forward_inputs(inputs, return_raw_logits)?
+                    let raw_logits = self.forward_inputs(inputs, return_raw_logits)?;
+                    if mistralrs_quant::serving_observation::enabled() {
+                        observe_successful_prefill_forward(
+                            input_seqs,
+                            is_prompt,
+                            &seq_indices,
+                            None,
+                            false,
+                        );
+                    }
+                    let raw_logits = raw_logits
                         .into_cpu_for_batch(input_seqs.len(), preserve_causal_generation)?;
                     let end = Instant::now();
                     exec_duration += end.duration_since(start);
@@ -2386,26 +2448,12 @@ pub trait Pipeline:
                             config.cache_type.to_dtype(metadata.activation_dtype)
                         )
                     });
-                    for (idx, seq) in input_seqs.iter_mut().enumerate() {
-                        let suffix = seq.get_toks().len().saturating_sub(seq.prefix_cache_len());
-                        let (count, max_tokens) =
-                            chunk_plans.as_ref().map_or((1, suffix), |plans| {
-                                (
-                                    plans[idx].len(),
-                                    plans[idx]
-                                        .iter()
-                                        .map(|chunk| chunk.end - chunk.start)
-                                        .max()
-                                        .unwrap_or(0),
-                                )
-                            });
+                    for seq in input_seqs.iter_mut() {
                         let observation = &mut seq.engine_observation;
                         observation.activation_dtype =
                             Some(format!("{:?}", metadata.activation_dtype));
                         observation.kv_dtype = kv_dtype.clone();
                         observation.paged_block_size = Some(block_size);
-                        observation.prefill_chunk_count = Some(count);
-                        observation.prefill_chunk_max_tokens = Some(max_tokens);
                     }
                 }
                 let cuda_decode_lookahead = lookahead.is_enabled()
@@ -2666,6 +2714,13 @@ pub trait Pipeline:
                         };
                         if mistralrs_quant::serving_observation::enabled() {
                             let host_forward_sec = start.elapsed().as_secs_f64();
+                            observe_successful_prefill_forward(
+                                input_seqs,
+                                is_prompt,
+                                &seq_indices,
+                                prompt_chunk.as_ref(),
+                                !has_suffix_only_prefill && !has_deferred_multimodal_prompt,
+                            );
                             for &seq_idx in &seq_indices {
                                 let observation = &mut input_seqs[seq_idx].engine_observation;
                                 if is_prompt {
@@ -3081,6 +3136,181 @@ mod tests {
     use candle_core::{Device, DeviceLocation, Tensor};
     use either::Either;
     use indexmap::IndexMap;
+
+    fn observation_prompt_chunk(rows: &[(usize, usize, usize)]) -> super::SpeculativePromptChunk {
+        super::SpeculativePromptChunk {
+            rows: rows
+                .iter()
+                .map(|&(seq_idx, start, end)| super::SpeculativePromptRow {
+                    seq_idx,
+                    range: (start, end),
+                    tokens: vec![0; 256],
+                })
+                .collect(),
+            is_final_prompt_chunk: true,
+        }
+    }
+
+    #[test]
+    fn observation_contract_prefill_geometry_ragged_remapped_indices() {
+        let chunk = observation_prompt_chunk(&[(2, 128, 134), (0, 128, 129)]);
+        assert_eq!(
+            super::observed_prefill_query_tokens(0, 3, &[0, 2], Some(&chunk)),
+            Some(1)
+        );
+        assert_eq!(
+            super::observed_prefill_query_tokens(2, 3, &[0, 2], Some(&chunk)),
+            Some(6)
+        );
+        assert_eq!(
+            super::observed_prefill_query_tokens(1, 3, &[0, 2], Some(&chunk)),
+            None
+        );
+    }
+
+    #[test]
+    fn observation_contract_prefill_geometry_invalid_ranges_and_mapping() {
+        for (rows, indices) in [
+            (vec![(0, 0, 8)], vec![0, 1]),
+            (vec![(0, 0, 8), (0, 0, 8)], vec![0, 1]),
+            (vec![(0, 0, 8), (1, 0, 8)], vec![0, 0]),
+            (vec![(0, 0, 8), (2, 0, 8)], vec![0, 2]),
+            (vec![(1, 0, 8)], vec![0]),
+            (vec![(0, 8, 8)], vec![0]),
+            (vec![(0, 9, 8)], vec![0]),
+            (vec![(0, 0, 257)], vec![0]),
+        ] {
+            let chunk = observation_prompt_chunk(&rows);
+            assert_eq!(
+                super::observed_prefill_query_tokens(0, 2, &indices, Some(&chunk)),
+                None
+            );
+        }
+        assert_eq!(super::observed_prefill_query_tokens(0, 2, &[0], None), None);
+    }
+
+    #[test]
+    fn observation_contract_successful_prefill_hook_aggregates_excludes_decode_and_failure() {
+        let mut first = crate::sequence::tests::make_observed_test_sequence();
+        let mut second = crate::sequence::tests::make_observed_test_sequence();
+        let mut third = crate::sequence::tests::make_observed_test_sequence();
+        let mut seqs = [&mut first, &mut second, &mut third];
+        let cold = observation_prompt_chunk(&[(0, 0, 128), (2, 0, 64)]);
+        let warm = observation_prompt_chunk(&[(2, 64, 70), (0, 128, 129)]);
+        {
+            let mut dispatch = |result: Result<(), ()>, is_prompt, indices: &[usize], chunk| {
+                result?;
+                super::observe_successful_prefill_forward(
+                    &mut seqs, is_prompt, indices, chunk, true,
+                );
+                Ok::<(), ()>(())
+            };
+            assert!(dispatch(Err(()), true, &[0, 2], Some(&cold)).is_err());
+            assert!(dispatch(Ok(()), false, &[0, 2], Some(&cold)).is_ok());
+            assert!(dispatch(Ok(()), true, &[2, 0], Some(&cold)).is_ok());
+            assert!(dispatch(Ok(()), true, &[0, 2], Some(&warm)).is_ok());
+        }
+        assert_eq!(first.engine_observation.prefill_chunk_count, Some(2));
+        assert_eq!(first.engine_observation.prefill_chunk_max_tokens, Some(128));
+        assert_eq!(second.engine_observation.prefill_chunk_count, None);
+        assert_eq!(second.engine_observation.prefill_chunk_max_tokens, None);
+        assert_eq!(third.engine_observation.prefill_chunk_count, Some(2));
+        assert_eq!(third.engine_observation.prefill_chunk_max_tokens, Some(64));
+    }
+
+    #[test]
+    fn observation_contract_prefill_hook_ambiguous_rows_clear_participants_permanently() {
+        let mut first = crate::sequence::tests::make_observed_test_sequence();
+        let mut second = crate::sequence::tests::make_observed_test_sequence();
+        let known = observation_prompt_chunk(&[(0, 0, 4), (1, 0, 8)]);
+        let ambiguous = observation_prompt_chunk(&[(0, 4, 8), (1, 8, 12)]);
+        let mut seqs = [&mut first, &mut second];
+        super::observe_successful_prefill_forward(&mut seqs, true, &[1, 0], Some(&known), true);
+        super::observe_successful_prefill_forward(&mut seqs, true, &[0], Some(&ambiguous), true);
+        super::observe_successful_prefill_forward(&mut seqs, true, &[1, 0], Some(&known), true);
+        for seq in seqs {
+            assert_eq!(seq.engine_observation.prefill_chunk_count, None);
+            assert_eq!(seq.engine_observation.prefill_chunk_max_tokens, None);
+        }
+    }
+
+    #[test]
+    fn observation_contract_suffix_only_prefill_geometry_is_unknown() {
+        for prefix in [3, 8, 9] {
+            let mut seq = crate::sequence::tests::make_observed_test_sequence().prefill_v2_normal(
+                Vec::new(),
+                vec![0; 8],
+                prefix,
+            );
+            let naive =
+                observation_prompt_chunk(&[(0, seq.prefix_cache_len(), seq.get_toks().len())]);
+            let has_suffix_only_prefill = seq.has_suffix_only_prefill_toks();
+            assert!(has_suffix_only_prefill);
+            assert_eq!(seq.active_prompt_query_range(), Some(prefix..prefix + 8));
+            if prefix == 3 {
+                assert_eq!(
+                    super::observed_prefill_query_tokens(0, 1, &[0], Some(&naive)),
+                    Some(5)
+                );
+            }
+            let known = observation_prompt_chunk(&[(0, 0, 8)]);
+            let mut seqs = [&mut seq];
+            super::observe_successful_prefill_forward(&mut seqs, true, &[0], Some(&known), true);
+            super::observe_successful_prefill_forward(
+                &mut seqs,
+                true,
+                &[0],
+                Some(&naive),
+                !has_suffix_only_prefill,
+            );
+            assert_eq!(seqs[0].engine_observation.prefill_chunk_count, None);
+            assert_eq!(seqs[0].engine_observation.prefill_chunk_max_tokens, None);
+            seqs[0].reset_prefill_toks();
+            seqs[0].set_prefix_cache_len(0);
+            super::observe_successful_prefill_forward(&mut seqs, true, &[0], Some(&known), true);
+            assert_eq!(seqs[0].engine_observation.prefill_chunk_count, None);
+            assert_eq!(seqs[0].engine_observation.prefill_chunk_max_tokens, None);
+        }
+    }
+
+    #[test]
+    fn observation_contract_deferred_and_default_prefill_geometry_is_unknown() {
+        let known = observation_prompt_chunk(&[(0, 0, 8)]);
+        for default_backend in [false, true] {
+            let mut seq = if default_backend {
+                crate::sequence::tests::make_observed_test_sequence()
+            } else {
+                crate::sequence::tests::make_observed_deferred_media_test_sequence()
+            };
+            let has_deferred_multimodal_prompt =
+                (seq.has_images() || seq.has_audios() || seq.has_videos())
+                    && seq.mm_features().is_empty();
+            assert_eq!(has_deferred_multimodal_prompt, !default_backend);
+            let unsupported_chunk = if default_backend { None } else { Some(&known) };
+            let geometry_supported = !default_backend && !has_deferred_multimodal_prompt;
+            let mut seqs = [&mut seq];
+            super::observe_successful_prefill_forward(&mut seqs, true, &[0], Some(&known), true);
+            super::observe_successful_prefill_forward(
+                &mut seqs,
+                false,
+                &[0],
+                unsupported_chunk,
+                geometry_supported,
+            );
+            assert_eq!(seqs[0].engine_observation.prefill_chunk_count, Some(1));
+            assert_eq!(seqs[0].engine_observation.prefill_chunk_max_tokens, Some(8));
+            super::observe_successful_prefill_forward(
+                &mut seqs,
+                true,
+                &[0],
+                unsupported_chunk,
+                geometry_supported,
+            );
+            super::observe_successful_prefill_forward(&mut seqs, true, &[0], Some(&known), true);
+            assert_eq!(seqs[0].engine_observation.prefill_chunk_count, None);
+            assert_eq!(seqs[0].engine_observation.prefill_chunk_max_tokens, None);
+        }
+    }
 
     fn prompt_chunk(start: usize, end: usize) -> PromptChunkPlan {
         PromptChunkPlan {

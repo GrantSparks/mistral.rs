@@ -80,7 +80,9 @@ pub struct EngineObservation {
     pub snapshot_evicted_bytes: Option<u64>,
     pub snapshot_host_copy_ns: Option<u64>,
     pub snapshot_write_measurement_complete: Option<bool>,
+    /// Successful prompt host-forward dispatches with exact sequence query ranges.
     pub prefill_chunk_count: Option<usize>,
+    /// Largest sequence query range in those dispatches, excluding batch padding.
     pub prefill_chunk_max_tokens: Option<usize>,
     pub prefill_host_forward_sec: Option<f64>,
     pub first_token_sequence_elapsed_ns: Option<u64>,
