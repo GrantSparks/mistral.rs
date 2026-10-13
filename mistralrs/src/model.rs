@@ -1227,6 +1227,17 @@ impl Model {
         Ok(self.runner.list_models_with_status()?)
     }
 
+    /// Consume this model and shut down its inference engines.
+    ///
+    /// Returns an error if another owner still shares the underlying runner. On success, all
+    /// engines have been joined before this method returns. Shutdown has no timeout guarantee.
+    pub async fn shutdown(self) -> crate::error::Result<()> {
+        self.runner
+            .shutdown()
+            .await
+            .map_err(|error| SdkError::Inference(error.into()))
+    }
+
     /// Get the underlying MistralRs instance.
     pub fn inner(&self) -> &MistralRs {
         &self.runner
