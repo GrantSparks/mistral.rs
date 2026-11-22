@@ -83,7 +83,7 @@ pub mod distributed;
 pub mod files;
 mod gdn;
 mod image_preflight;
-pub use image_preflight::{PreparedImageChatRequest, PreparedImagePrompt, PreparedImageView};
+pub use image_preflight::{PreparedChatRequest, PreparedImagePrompt, PreparedImageView};
 mod gguf;
 pub mod layers;
 mod layers_masker;

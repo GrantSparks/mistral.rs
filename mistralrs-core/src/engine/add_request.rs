@@ -101,13 +101,13 @@ impl Engine {
                     self.add_request(*request, None).await;
                 }
             }
-            Request::PreparedImageChat(prepared) => {
+            Request::PreparedChat(prepared) => {
                 if !prepared.pipeline.ptr_eq(&Arc::downgrade(&self.pipeline)) {
                     let _ = prepared
                         .request
                         .response
                         .send(Response::ValidationError(
-                            "prepared image chat does not belong to this pipeline".into(),
+                            "prepared chat does not belong to this pipeline".into(),
                         ))
                         .await;
                 } else {
@@ -150,7 +150,7 @@ impl Engine {
     async fn add_request(
         &self,
         mut request: NormalRequest,
-        prepared: Option<Arc<crate::PreparedImagePrompt>>,
+        prepared: Option<Arc<crate::image_preflight::PreparedChatPrompt>>,
     ) {
         if request.response.is_closed() {
             return;
@@ -326,8 +326,8 @@ impl Engine {
 
         let (mut prompt_tokens, prompt_text) = if let Some(prepared) = &prepared {
             let max_context = get_mut_arcmutex!(self.pipeline).get_metadata().max_seq_len;
-            if prepared
-                .prefix_token_ids
+            let (tokens, rendered) = prepared.prompt();
+            if tokens
                 .len()
                 .checked_add(request.sampling_params.max_len.unwrap_or(1))
                 .is_none_or(|context| context > max_context)
@@ -335,12 +335,12 @@ impl Engine {
                 let _ = request
                     .response
                     .send(Response::ValidationError(
-                        "expanded image chat exceeds the model context".into(),
+                        "prepared chat exceeds the model context".into(),
                     ))
                     .await;
                 return;
             }
-            (prepared.prefix_token_ids.clone(), prepared.prompt.clone())
+            (tokens.to_vec(), rendered.to_owned())
         } else {
             match request.messages {
                 RequestMessage::Chat {

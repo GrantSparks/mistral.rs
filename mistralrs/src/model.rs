@@ -81,19 +81,34 @@ pub struct Model {
     pub(crate) runner: Arc<MistralRs>,
 }
 
-/// An image chat prepared by a loaded pipeline and ready for one streaming dispatch.
-pub struct PreparedImageChat {
-    prepared: PreparedImageChatRequest,
+/// A text or image chat prepared by a loaded pipeline for one streaming dispatch.
+pub struct PreparedChat {
+    prepared: PreparedChatRequest,
     rx: Receiver<Response>,
 }
 
-impl PreparedImageChat {
+impl PreparedChat {
+    /// The prompt tokens the pipeline will submit for prefill.
     pub fn prefix_token_ids(&self) -> &[u32] {
         self.prepared.prefix_token_ids()
     }
 
+    /// Image proof entries in prompt order, empty for text chat.
     pub fn views(&self) -> &[PreparedImageView] {
         self.prepared.views()
+    }
+}
+
+/// An image chat prepared by a loaded pipeline for one streaming dispatch.
+pub struct PreparedImageChat(PreparedChat);
+
+impl PreparedImageChat {
+    pub fn prefix_token_ids(&self) -> &[u32] {
+        self.0.prefix_token_ids()
+    }
+
+    pub fn views(&self) -> &[PreparedImageView] {
+        self.0.views()
     }
 }
 
@@ -300,11 +315,11 @@ impl Model {
         Ok(Stream { _server: self, rx })
     }
 
-    /// Prepare an ordered image chat and measure the exact prompt and image tensors before inference.
-    pub async fn prepare_image_chat(
+    /// Prepare the exact chat prompt and any supported image tensors before inference.
+    pub async fn prepare_chat(
         &self,
         request: crate::RequestBuilder,
-    ) -> crate::error::Result<PreparedImageChat> {
+    ) -> crate::error::Result<PreparedChat> {
         let model_id = self
             .runner
             .get_default_model_id()
@@ -313,10 +328,38 @@ impl Model {
         let (request, rx) = self.build_streaming_chat_request(request, Some(&model_id))?;
         let prepared = self
             .runner
-            .prepare_image_chat(request)
+            .prepare_chat(request)
             .await
             .map_err(|error| SdkError::Inference(error.into()))?;
-        Ok(PreparedImageChat { prepared, rx })
+        Ok(PreparedChat { prepared, rx })
+    }
+
+    /// Stream a previously prepared chat on the same loaded pipeline.
+    pub async fn stream_prepared_chat(
+        &self,
+        request: PreparedChat,
+    ) -> crate::error::Result<Stream<'_>> {
+        self.runner
+            .stream_prepared_chat(request.prepared)
+            .await
+            .map_err(|error| SdkError::Inference(error.into()))?;
+        Ok(Stream {
+            _server: self,
+            rx: request.rx,
+        })
+    }
+
+    /// Prepare an ordered image chat and measure the exact prompt and image tensors before inference.
+    pub async fn prepare_image_chat(
+        &self,
+        request: crate::RequestBuilder,
+    ) -> crate::error::Result<PreparedImageChat> {
+        if request.images_ref().is_empty() {
+            return Err(SdkError::RequestValidation(
+                "prepared image chat requires images".to_string(),
+            ));
+        }
+        self.prepare_chat(request).await.map(PreparedImageChat)
     }
 
     /// Stream a previously prepared image chat on the same loaded pipeline.
@@ -324,14 +367,7 @@ impl Model {
         &self,
         request: PreparedImageChat,
     ) -> crate::error::Result<Stream<'_>> {
-        self.runner
-            .stream_prepared_image_chat(request.prepared)
-            .await
-            .map_err(|error| SdkError::Inference(error.into()))?;
-        Ok(Stream {
-            _server: self,
-            rx: request.rx,
-        })
+        self.stream_prepared_chat(request.0).await
     }
 
     fn build_streaming_chat_request<R: RequestLike>(

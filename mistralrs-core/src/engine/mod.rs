@@ -923,7 +923,7 @@ impl Engine {
             Request::Normal(request) => admission::AdmissionClass::Workload {
                 sequences: request.sampling_params.n_choices.max(1),
             },
-            Request::PreparedImageChat(_) => admission::AdmissionClass::Workload { sequences: 1 },
+            Request::PreparedChat(_) => admission::AdmissionClass::Workload { sequences: 1 },
             Request::Tokenize(_) | Request::Detokenize(_) | Request::TerminateAllSeqsNextStep => {
                 admission::AdmissionClass::BypassControl
             }

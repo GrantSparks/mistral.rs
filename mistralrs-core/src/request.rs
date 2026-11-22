@@ -590,7 +590,7 @@ pub enum Request {
     Normal(Box<NormalRequest>),
     #[doc(hidden)]
     #[serde(skip)]
-    PreparedImageChat(crate::PreparedImageChatRequest),
+    PreparedChat(crate::PreparedChatRequest),
     ReIsq(IsqType),
     Calibration(CalibrationRequest),
     Tokenize(TokenizationRequest),
@@ -605,7 +605,7 @@ impl Request {
     pub(crate) fn normal(&self) -> Option<&NormalRequest> {
         match self {
             Self::Normal(request) => Some(request),
-            Self::PreparedImageChat(prepared) => Some(&prepared.request),
+            Self::PreparedChat(prepared) => Some(&prepared.request),
             _ => None,
         }
     }
@@ -613,7 +613,7 @@ impl Request {
     pub(crate) fn normal_mut(&mut self) -> Option<&mut NormalRequest> {
         match self {
             Self::Normal(request) => Some(request),
-            Self::PreparedImageChat(prepared) => Some(&mut prepared.request),
+            Self::PreparedChat(prepared) => Some(&mut prepared.request),
             _ => None,
         }
     }
@@ -635,7 +635,7 @@ impl Debug for Request {
                     "Request {id} {{ messages: `{messages:?}`, sampling_params: {sampling_params:?}, is_streaming: {is_streaming}}}",
                 )
             }
-            Request::PreparedImageChat(_) => f.write_str("Prepared image chat"),
+            Request::PreparedChat(_) => f.write_str("Prepared chat"),
             Request::ReIsq(tp) => {
                 write!(f, "Re ISQ Request {tp:?}",)
             }

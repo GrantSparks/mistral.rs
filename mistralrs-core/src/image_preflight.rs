@@ -7,8 +7,8 @@ use anyhow::{bail, Context, Result};
 use candle_core::Tensor;
 
 use crate::{
-    paged_attention::block_hash::MultiModalFeature, sequence::Sequence, MistralRs, NormalRequest,
-    Pipeline, Request, RequestMessage,
+    paged_attention::block_hash::MultiModalFeature, sequence::Sequence, MistralRs, ModelCategory,
+    NormalRequest, Pipeline, Request, RequestMessage,
 };
 
 type LoadedPipeline = tokio::sync::Mutex<dyn Pipeline>;
@@ -39,22 +39,45 @@ impl PreparedImagePrompt {
     }
 }
 
+pub(crate) enum PreparedChatPrompt {
+    Text { tokens: Vec<u32>, rendered: String },
+    Image(PreparedImagePrompt),
+}
+
+impl PreparedChatPrompt {
+    pub(crate) fn prompt(&self) -> (&[u32], &str) {
+        match self {
+            Self::Text { tokens, rendered } => (tokens, rendered),
+            Self::Image(image) => (&image.prefix_token_ids, &image.prompt),
+        }
+    }
+
+    pub(crate) fn install(&self, sequence: &mut Sequence) {
+        if let Self::Image(image) = self {
+            image.install(sequence);
+        }
+    }
+}
+
 #[derive(Clone)]
 #[doc(hidden)]
-pub struct PreparedImageChatRequest {
+pub struct PreparedChatRequest {
     pub(crate) request: Box<NormalRequest>,
-    pub(crate) prompt: Arc<PreparedImagePrompt>,
+    pub(crate) prompt: Arc<PreparedChatPrompt>,
     pub(crate) pipeline: Weak<LoadedPipeline>,
     model_id: String,
 }
 
-impl PreparedImageChatRequest {
+impl PreparedChatRequest {
     pub fn prefix_token_ids(&self) -> &[u32] {
-        &self.prompt.prefix_token_ids
+        self.prompt.prompt().0
     }
 
     pub fn views(&self) -> &[PreparedImageView] {
-        &self.prompt.views
+        match &*self.prompt {
+            PreparedChatPrompt::Text { .. } => &[],
+            PreparedChatPrompt::Image(image) => &image.views,
+        }
     }
 }
 
@@ -66,12 +89,9 @@ fn local_preflight_available() -> bool {
 
 impl MistralRs {
     #[doc(hidden)]
-    pub async fn prepare_image_chat(
-        &self,
-        request: Box<NormalRequest>,
-    ) -> Result<PreparedImageChatRequest> {
+    pub async fn prepare_chat(&self, request: Box<NormalRequest>) -> Result<PreparedChatRequest> {
         if !local_preflight_available() {
-            bail!("prepared image chat requires a local engine");
+            bail!("prepared chat requires a local engine");
         }
         if request.truncate_sequence
             || request.sampling_params.n_choices != 1
@@ -88,7 +108,7 @@ impl MistralRs {
             || request.files.is_some()
             || !request.input_files.is_empty()
         {
-            bail!("prepared image chat requires a single choice without truncation or tools");
+            bail!("prepared chat requires a single choice without truncation or tools");
         }
         let model_id = self.resolve_alias_or_default(request.model_id.as_deref())?;
         let pipeline = self
@@ -96,49 +116,16 @@ impl MistralRs {
             .read()
             .map_err(|_| crate::MistralRsError::EnginePoisoned)?
             .get(&model_id)
-            .with_context(|| format!("model {model_id} must be loaded for image preflight"))?
+            .with_context(|| format!("model {model_id} must be loaded for chat preflight"))?
             .reboot_state
             .pipeline
             .clone();
         tokio::task::spawn_blocking(move || {
-            let RequestMessage::MultimodalChat {
-                images,
-                audios,
-                videos,
-                messages,
-                enable_thinking,
-                reasoning_effort,
-            } = &request.messages
-            else {
-                bail!("prepared image chat requires image messages");
-            };
-            if images.is_empty() || !audios.is_empty() || !videos.is_empty() {
-                bail!("prepared image chat accepts only images and text");
-            }
             let prompt = {
                 let pipeline = pipeline.blocking_lock();
-                let tokenizer = pipeline
-                    .tokenizer()
-                    .context("image preflight needs a tokenizer")?;
-                let processor = pipeline.get_processor();
-                let (tokens, _) = processor.process(
-                    &*pipeline,
-                    messages.clone(),
-                    true,
-                    true,
-                    *enable_thinking,
-                    *reasoning_effort,
-                    Vec::new(),
-                )?;
-                processor.inputs_processor().prepare_image_prompt(
-                    &tokenizer,
-                    &tokens,
-                    images,
-                    &pipeline.device(),
-                    pipeline.get_input_processor_config(),
-                )?
+                prepare_chat_prompt(&*pipeline, &request.messages)?
             };
-            Ok(PreparedImageChatRequest {
+            Ok(PreparedChatRequest {
                 request,
                 prompt: Arc::new(prompt),
                 pipeline: Arc::downgrade(&pipeline),
@@ -149,12 +136,9 @@ impl MistralRs {
     }
 
     #[doc(hidden)]
-    pub async fn stream_prepared_image_chat(
-        &self,
-        prepared: PreparedImageChatRequest,
-    ) -> Result<()> {
+    pub async fn stream_prepared_chat(&self, prepared: PreparedChatRequest) -> Result<()> {
         if !local_preflight_available() {
-            bail!("prepared image chat requires a local engine");
+            bail!("prepared chat requires a local engine");
         }
         let sender = {
             let engines = self
@@ -169,10 +153,72 @@ impl MistralRs {
                             .pipeline
                             .ptr_eq(&Arc::downgrade(&engine.reboot_state.pipeline))
                 })
-                .context("the pipeline that prepared this image chat is no longer loaded")?;
+                .context("the pipeline that prepared this chat is no longer loaded")?;
             engine.sender.clone()
         };
-        sender.send(Request::PreparedImageChat(prepared)).await?;
+        sender.send(Request::PreparedChat(prepared)).await?;
         Ok(())
     }
 }
+
+fn prepare_chat_prompt(
+    pipeline: &dyn Pipeline,
+    request: &RequestMessage,
+) -> Result<PreparedChatPrompt> {
+    if !matches!(
+        pipeline.category(),
+        ModelCategory::Text | ModelCategory::Multimodal { .. }
+    ) || !pipeline
+        .get_chat_template()
+        .is_some_and(|template| template.has_chat_template())
+    {
+        bail!("prepared chat requires a text or multimodal pipeline with a chat template");
+    }
+    let (messages, enable_thinking, reasoning_effort, images) = match request {
+        RequestMessage::Chat {
+            messages,
+            enable_thinking,
+            reasoning_effort,
+        } => (messages, *enable_thinking, *reasoning_effort, None),
+        RequestMessage::MultimodalChat {
+            messages,
+            enable_thinking,
+            reasoning_effort,
+            images,
+            audios,
+            videos,
+        } if !images.is_empty() && audios.is_empty() && videos.is_empty() => {
+            (messages, *enable_thinking, *reasoning_effort, Some(images))
+        }
+        _ => bail!("prepared chat accepts only text and image chat messages"),
+    };
+    let processor = pipeline.get_processor();
+    let (tokens, rendered) = processor.process(
+        pipeline,
+        messages.clone(),
+        true,
+        true,
+        enable_thinking,
+        reasoning_effort,
+        Vec::new(),
+    )?;
+    if let Some(images) = images {
+        let tokenizer = pipeline
+            .tokenizer()
+            .context("image preflight needs a tokenizer")?;
+        return Ok(PreparedChatPrompt::Image(
+            processor.inputs_processor().prepare_image_prompt(
+                &tokenizer,
+                &tokens,
+                images,
+                &pipeline.device(),
+                pipeline.get_input_processor_config(),
+            )?,
+        ));
+    }
+    Ok(PreparedChatPrompt::Text { tokens, rendered })
+}
+
+#[cfg(test)]
+#[path = "image_preflight_tests.rs"]
+mod tests;
