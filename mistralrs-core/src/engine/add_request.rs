@@ -98,7 +98,21 @@ impl Engine {
                     if is_chat && !request.input_files.is_empty() {
                         agentic_loop::inject_input_files_message(&mut request);
                     }
-                    self.add_request(*request).await;
+                    self.add_request(*request, None).await;
+                }
+            }
+            Request::PreparedImageChat(prepared) => {
+                if !prepared.pipeline.ptr_eq(&Arc::downgrade(&self.pipeline)) {
+                    let _ = prepared
+                        .request
+                        .response
+                        .send(Response::ValidationError(
+                            "prepared image chat does not belong to this pipeline".into(),
+                        ))
+                        .await;
+                } else {
+                    self.add_request(*prepared.request, Some(prepared.prompt))
+                        .await;
                 }
             }
             Request::ReIsq(level) => {
@@ -133,7 +147,11 @@ impl Engine {
         }
     }
 
-    pub(super) async fn add_request(&self, mut request: NormalRequest) {
+    async fn add_request(
+        &self,
+        mut request: NormalRequest,
+        prepared: Option<Arc<crate::PreparedImagePrompt>>,
+    ) {
         if request.response.is_closed() {
             return;
         }
@@ -306,90 +324,109 @@ impl Engine {
         };
         let mut added_seq = false;
 
-        let (mut prompt_tokens, prompt_text) = match request.messages {
-            RequestMessage::Chat {
-                messages,
-                enable_thinking,
-                reasoning_effort,
+        let (mut prompt_tokens, prompt_text) = if let Some(prepared) = &prepared {
+            let max_context = get_mut_arcmutex!(self.pipeline).get_metadata().max_seq_len;
+            if prepared
+                .prefix_token_ids
+                .len()
+                .checked_add(request.sampling_params.max_len.unwrap_or(1))
+                .is_none_or(|context| context > max_context)
+            {
+                let _ = request
+                    .response
+                    .send(Response::ValidationError(
+                        "expanded image chat exceeds the model context".into(),
+                    ))
+                    .await;
+                return;
             }
-            | RequestMessage::MultimodalChat {
-                images: _,
-                audios: _,
-                videos: _,
-                messages,
-                enable_thinking,
-                reasoning_effort,
-            } => {
-                let pipeline = &*get_mut_arcmutex!(self.pipeline);
-                let tools = tools_for_chat_template(
-                    request.tools.as_deref(),
-                    request.tool_choice.as_ref(),
-                    preferred_tool_call_format,
-                );
-                let template = pipeline.get_processor().process(
-                    pipeline,
+            (prepared.prefix_token_ids.clone(), prepared.prompt.clone())
+        } else {
+            match request.messages {
+                RequestMessage::Chat {
                     messages,
-                    true,
-                    true,
                     enable_thinking,
                     reasoning_effort,
-                    tools,
-                );
-                match template {
-                    Ok(template) => template,
-                    Err(error) => {
-                        let response = if is_chat_template_request_error(&error) {
-                            Response::ValidationError(error.into())
-                        } else {
-                            Response::InternalError(error.into())
-                        };
+                }
+                | RequestMessage::MultimodalChat {
+                    images: _,
+                    audios: _,
+                    videos: _,
+                    messages,
+                    enable_thinking,
+                    reasoning_effort,
+                } => {
+                    let pipeline = &*get_mut_arcmutex!(self.pipeline);
+                    let tools = tools_for_chat_template(
+                        request.tools.as_deref(),
+                        request.tool_choice.as_ref(),
+                        preferred_tool_call_format,
+                    );
+                    let template = pipeline.get_processor().process(
+                        pipeline,
+                        messages,
+                        true,
+                        true,
+                        enable_thinking,
+                        reasoning_effort,
+                        tools,
+                    );
+                    match template {
+                        Ok(template) => template,
+                        Err(error) => {
+                            let response = if is_chat_template_request_error(&error) {
+                                Response::ValidationError(error.into())
+                            } else {
+                                Response::InternalError(error.into())
+                            };
+                            request
+                                .response
+                                .send(response)
+                                .await
+                                .unwrap_or_else(|_| warn!("Receiver disconnected"));
+                            return;
+                        }
+                    }
+                }
+                RequestMessage::Completion { text, .. }
+                | RequestMessage::Embedding { prompt: text } => {
+                    let Some(tokenizer) = &get_mut_arcmutex!(self.pipeline).tokenizer() else {
                         request
                             .response
-                            .send(response)
+                            .send(Response::ValidationError(
+                                "Completion requests require the pipeline to have a tokenizer"
+                                    .into(),
+                            ))
                             .await
                             .unwrap_or_else(|_| warn!("Receiver disconnected"));
                         return;
-                    }
+                    };
+                    let prompt = tokenizer
+                        .encode_fast(text.clone(), true)
+                        .map_err(anyhow::Error::msg);
+                    (
+                        handle_seq_error!(prompt, request.response)
+                            .get_ids()
+                            .to_vec(),
+                        text,
+                    )
                 }
-            }
-            RequestMessage::Completion { text, .. }
-            | RequestMessage::Embedding { prompt: text } => {
-                let Some(tokenizer) = &get_mut_arcmutex!(self.pipeline).tokenizer() else {
-                    request
-                        .response
-                        .send(Response::ValidationError(
-                            "Completion requests require the pipeline to have a tokenizer".into(),
-                        ))
-                        .await
-                        .unwrap_or_else(|_| warn!("Receiver disconnected"));
-                    return;
-                };
-                let prompt = tokenizer
-                    .encode_fast(text.clone(), true)
-                    .map_err(anyhow::Error::msg);
-                (
-                    handle_seq_error!(prompt, request.response)
-                        .get_ids()
-                        .to_vec(),
-                    text,
-                )
-            }
-            RequestMessage::ImageGeneration { prompt, .. }
-            | RequestMessage::SpeechGeneration { prompt } => (vec![u32::MAX], prompt),
-            RequestMessage::CompletionTokens(it)
-            | RequestMessage::EmbeddingTokens { prompt: it } => {
-                let Some(tokenizer) = &get_mut_arcmutex!(self.pipeline).tokenizer() else {
-                    request
+                RequestMessage::ImageGeneration { prompt, .. }
+                | RequestMessage::SpeechGeneration { prompt } => (vec![u32::MAX], prompt),
+                RequestMessage::CompletionTokens(it)
+                | RequestMessage::EmbeddingTokens { prompt: it } => {
+                    let Some(tokenizer) = &get_mut_arcmutex!(self.pipeline).tokenizer() else {
+                        request
                         .response
                         .send(Response::ValidationError(
                             "Completion requests w/ raw tokens require the pipeline to have a tokenizer".into(),
                         ))
                         .await
                         .unwrap_or_else(|_| warn!("Receiver disconnected"));
-                    return;
-                };
-                if let Some(token_id) = first_unknown_token_id(tokenizer, &it) {
-                    request
+                        return;
+                    };
+                    if let Some(token_id) = first_unknown_token_id(tokenizer, &it) {
+                        request
                         .response
                         .send(Response::ValidationError(
                             format!(
@@ -399,12 +436,13 @@ impl Engine {
                         ))
                         .await
                         .unwrap_or_else(|_| warn!("Receiver disconnected"));
-                    return;
+                        return;
+                    }
+                    let prompt = tokenizer
+                        .decode(&it, false)
+                        .map_err(|e| anyhow::Error::msg(e.to_string()));
+                    (it, handle_seq_error!(prompt, request.response))
                 }
-                let prompt = tokenizer
-                    .decode(&it, false)
-                    .map_err(|e| anyhow::Error::msg(e.to_string()));
-                (it, handle_seq_error!(prompt, request.response))
             }
         };
         if prompt_tokens.is_empty() {
@@ -843,7 +881,9 @@ impl Engine {
             // Rely on the sequence's attached modalities rather than just the top-level request
             // fields so historical images/audios in a reconstructed multi-turn conversation
             // still get their prompt rewrite and mm-feature setup before cache matching.
-            if seq.has_images() || seq.has_audios() || seq.has_videos() {
+            if let Some(prepared) = &prepared {
+                prepared.install(&mut seq);
+            } else if seq.has_images() || seq.has_audios() || seq.has_videos() {
                 let pipeline = get_mut_arcmutex!(self.pipeline);
                 let result = pipeline
                     .get_processor()

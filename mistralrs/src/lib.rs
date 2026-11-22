@@ -242,6 +242,7 @@ pub use messages::{
     EmbeddingRequest, EmbeddingRequestBuilder, EmbeddingRequestInput, InputFile,
     MultimodalMessages, RequestBuilder, RequestLike, TextMessageRole, TextMessages,
 };
+pub use mistralrs_core::PreparedImageView;
 pub use mistralrs_core::{
     inference_observations_enabled, AgentPermission, AgentToolApproval,
     AgentToolApprovalAsyncCallback, AgentToolApprovalCallback, AgentToolApprovalDecision,
@@ -270,7 +271,7 @@ pub use mistralrs_core::{
 };
 pub use mistralrs_core::{SerializedSession, SerializedVideo};
 pub use mistralrs_core::{MISTRALRS_GIT_REVISION, MISTRALRS_VERSION};
-pub use model::{best_device, Model};
+pub use model::{best_device, Model, PreparedImageChat};
 pub use model_builder_trait::{AnyModelBuilder, MultiModelBuilder};
 pub use multimodal_model::{MultimodalModelBuilder, UqffMultimodalModelBuilder};
 pub use speech_model::SpeechModelBuilder;

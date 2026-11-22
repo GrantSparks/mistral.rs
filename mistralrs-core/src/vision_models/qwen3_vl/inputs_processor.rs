@@ -13,7 +13,9 @@ use crate::{
         InputProcessorOutput, InputsProcessor, InputsProcessorType, InputsProcessorValidationError,
         MessagesAction, Processor,
     },
-    sequence::{find_placeholder_delimited_ranges, Sequence},
+    sequence::{
+        find_image_placeholder_ranges, find_placeholder_delimited_ranges, MultimodalData, Sequence,
+    },
     vision_models::{
         image_processor::{ImagePreProcessor, PreprocessedImages},
         multimodal_layout::{
@@ -28,6 +30,7 @@ use crate::{
         },
         ModelInputs,
     },
+    PreparedImagePrompt, PreparedImageView,
 };
 use anyhow::{Context, Result};
 use candle_core::{DType, Device, IndexOp, Tensor};
@@ -35,6 +38,7 @@ use image::{imageops::FilterType, DynamicImage, GenericImageView};
 use mistralrs_vision::{
     ApplyTensorTransforms, ApplyTransforms, Normalize, TensorTransforms, ToTensor, Transforms,
 };
+use sha2::{Digest, Sha256};
 use std::{
     any::Any,
     collections::hash_map::DefaultHasher,
@@ -769,6 +773,120 @@ fn qwen3_decode_args(input_ids: &Tensor, seqlens: Vec<usize>) -> Qwen3VLVisionSp
 }
 
 impl InputsProcessor for Qwen3VLImageProcessor {
+    fn prepare_image_prompt(
+        &self,
+        tokenizer: &Tokenizer,
+        tokens: &[u32],
+        images: &[DynamicImage],
+        device: &Device,
+        other_config: Option<Arc<dyn Any>>,
+    ) -> Result<PreparedImagePrompt> {
+        let config = other_config
+            .as_ref()
+            .and_then(|config| config.downcast_ref::<PreProcessorConfig>())
+            .context("Qwen image preflight requires a processor configuration")?;
+        let merge = Self::merge_size(config);
+        let resize_factor =
+            if config.do_resize.is_none_or(|resize| resize) && self.max_edge.is_none() {
+                Self::patch_size(config)
+                    .checked_mul(merge)
+                    .filter(|factor| *factor > 0)
+            } else {
+                None
+            };
+        validate_qwen_media_dimensions(images, resize_factor)?;
+        let processed = self.preprocess(
+            images.to_vec(),
+            vec![],
+            config,
+            device,
+            (usize::MAX, usize::MAX),
+        )?;
+        let grid = processed
+            .image_grid_thw
+            .context("Qwen processor returned no image grid")?;
+        let pixels = processed.pixel_values;
+        let mut prompt = tokenizer
+            .decode(tokens, false)
+            .map_err(anyhow::Error::msg)?;
+        let merge_area = merge
+            .checked_mul(merge)
+            .filter(|area| *area > 0)
+            .context("invalid Qwen merge size")?;
+        expand_media_placeholders(
+            &mut prompt,
+            Qwen3VLProcessor::IMAGE_PAD,
+            Qwen3VLProcessor::PLACEHOLDER,
+            Some(&grid),
+            images.len(),
+            merge_area,
+            MultimodalKind::Image,
+        )?;
+        let encoding = tokenizer
+            .encode_fast(prompt.as_str(), false)
+            .map_err(anyhow::Error::msg)?;
+        let prefix_token_ids = encoding.get_ids().to_vec();
+        let special_token = |name| {
+            tokenizer
+                .token_to_id(name)
+                .with_context(|| format!("Qwen tokenizer is missing {name}"))
+        };
+        let img_pad = special_token(Qwen3VLProcessor::IMAGE_PAD)?;
+        let start_id = special_token(Qwen3VLProcessor::VISION_START)?;
+        let end_id = special_token(Qwen3VLProcessor::VISION_END)?;
+        let data = MultimodalData::new(Some(images.to_vec()), None, None, None, None, None);
+        let features = validated_mm_features(
+            &find_placeholder_delimited_ranges(&prefix_token_ids, img_pad, start_id, end_id),
+            data.image_hashes().unwrap_or_default(),
+            MultimodalKind::Image,
+        )?;
+        let spans = find_image_placeholder_ranges(&prefix_token_ids, img_pad);
+        let rows = grid.to_vec2::<u32>()?;
+        if spans.len() != images.len() || rows.len() != spans.len() {
+            anyhow::bail!("Qwen image spans and grids must match the ordered inputs");
+        }
+        let mut offset: usize = 0;
+        let mut views = Vec::with_capacity(spans.len());
+        for ((start, len), row) in spans.into_iter().zip(rows) {
+            let patches = row
+                .iter()
+                .try_fold(1_usize, |size, &item| size.checked_mul(item as usize))
+                .filter(|&patches| row.len() == 3 && patches > 0)
+                .context("invalid Qwen image grid")?;
+            if len.checked_mul(merge_area) != Some(patches) {
+                anyhow::bail!("Qwen image token span disagrees with its grid");
+            }
+            let values = pixels
+                .narrow(0, offset, patches)?
+                .to_device(&Device::Cpu)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1::<f32>()?;
+            let mut digest = Sha256::new();
+            for value in values {
+                digest.update(value.to_le_bytes());
+            }
+            views.push(PreparedImageView {
+                image_tokens: start..start + len,
+                pixel_sha256: digest.finalize().into(),
+            });
+            offset = offset
+                .checked_add(patches)
+                .context("Qwen image grid exceeds address space")?;
+        }
+        if offset != pixels.dim(0)? {
+            anyhow::bail!("Qwen image grids do not cover the processor output");
+        }
+        Ok(PreparedImagePrompt {
+            prefix_token_ids,
+            prompt,
+            pixels,
+            grid,
+            features,
+            views,
+        })
+    }
+
     fn get_type(&self) -> InputsProcessorType {
         InputsProcessorType::Vision
     }
@@ -2241,3 +2359,7 @@ mod tests {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "image_preflight_tests.rs"]
+mod image_preflight_tests;

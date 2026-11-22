@@ -114,3 +114,44 @@ while let Some(item) = stream.next().await {
 ```
 
 `full_response` holds the complete assistant output once the stream ends; use it to log or persist the final text.
+
+## Prepared image chat
+
+With a loaded Qwen image-chat pipeline on a local engine, call
+`Model::prepare_image_chat` to obtain the expanded prefix token IDs and
+the SHA-256 and pad-token span for each processed image. The digest covers
+the patch-major tensor values in little-endian f32 order. This call prepares
+the prompt without running model inference.
+
+Set the request's completion allowance before preparing it. The context
+check includes the expanded prompt and that allowance. Consume the
+prepared request with `Model::stream_prepared_image_chat`; dispatch depends
+on the originally loaded pipeline remaining available.
+
+```rust
+use mistralrs::{Model, RequestBuilder, TextMessageRole};
+
+async fn inspect_then_stream(
+    model: &Model,
+    image: image::DynamicImage,
+) -> anyhow::Result<()> {
+    let request = RequestBuilder::new()
+        .add_image_message(TextMessageRole::User, "Describe this image.", vec![image])
+        .set_sampler_max_len(64);
+    let prepared = model.prepare_image_chat(request).await?;
+    println!("Prompt tokens {}", prepared.prefix_token_ids().len());
+    for view in prepared.views() {
+        println!("Image pad tokens {:?}", view.image_tokens);
+    }
+
+    let mut stream = model.stream_prepared_image_chat(prepared).await?;
+    while let Some(response) = stream.next().await {
+        if let mistralrs::Response::Chunk(chunk) = response {
+            if let Some(content) = &chunk.choices[0].delta.content {
+                print!("{content}");
+            }
+        }
+    }
+    Ok(())
+}
+```

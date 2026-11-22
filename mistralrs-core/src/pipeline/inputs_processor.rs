@@ -51,6 +51,17 @@ mod validation_error_tests {
 
 /// Processor: Prepare inputs for the model (potentially preparing the images if applicable)
 pub trait InputsProcessor {
+    fn prepare_image_prompt(
+        &self,
+        _tokenizer: &Tokenizer,
+        _tokens: &[u32],
+        _images: &[image::DynamicImage],
+        _device: &Device,
+        _other_config: Option<Arc<dyn Any>>,
+    ) -> Result<crate::PreparedImagePrompt> {
+        anyhow::bail!("this processor does not support prepared image chat")
+    }
+
     fn prepare_for_paged_prompt_planning(
         &self,
         _tokenizer: Option<Arc<Tokenizer>>,

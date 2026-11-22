@@ -896,7 +896,7 @@ impl Engine {
         if Self::request_is_abandoned(&request) {
             return None;
         }
-        if let Request::Normal(request) = &mut request {
+        if let Some(request) = request.normal_mut() {
             request.mark_enqueued();
         }
         if let Err(error) = self.resolve_adapter_generation(&mut request) {
@@ -913,7 +913,9 @@ impl Engine {
     }
 
     fn request_is_abandoned(request: &Request) -> bool {
-        matches!(request, Request::Normal(request) if request.response_is_closed())
+        request
+            .normal()
+            .is_some_and(|request| request.response_is_closed())
     }
 
     fn admission_class(request: &Request) -> admission::AdmissionClass {
@@ -921,6 +923,7 @@ impl Engine {
             Request::Normal(request) => admission::AdmissionClass::Workload {
                 sequences: request.sampling_params.n_choices.max(1),
             },
+            Request::PreparedImageChat(_) => admission::AdmissionClass::Workload { sequences: 1 },
             Request::Tokenize(_) | Request::Detokenize(_) | Request::TerminateAllSeqsNextStep => {
                 admission::AdmissionClass::BypassControl
             }
@@ -967,7 +970,7 @@ impl Engine {
     }
 
     async fn dispatch_prepared_request(self: &Arc<Self>, mut request: Request) -> bool {
-        if let Request::Normal(request) = &mut request {
+        if let Some(request) = request.normal_mut() {
             if let Some(duration) = request.take_queue_duration() {
                 metrics::histogram!(crate::REQUEST_QUEUE_DURATION_METRIC)
                     .record(duration.as_secs_f64());

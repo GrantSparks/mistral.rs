@@ -81,6 +81,22 @@ pub struct Model {
     pub(crate) runner: Arc<MistralRs>,
 }
 
+/// An image chat prepared by a loaded pipeline and ready for one streaming dispatch.
+pub struct PreparedImageChat {
+    prepared: PreparedImageChatRequest,
+    rx: Receiver<Response>,
+}
+
+impl PreparedImageChat {
+    pub fn prefix_token_ids(&self) -> &[u32] {
+        self.prepared.prefix_token_ids()
+    }
+
+    pub fn views(&self) -> &[PreparedImageView] {
+        self.prepared.views()
+    }
+}
+
 /// Token-by-token stream returned by [`Model::stream_chat_request`].
 ///
 /// Implements [`futures::Stream`], so you can use `StreamExt` combinators
@@ -273,9 +289,56 @@ impl Model {
     /// If `model_id` is `None`, the request is sent to the default model.
     pub async fn stream_chat_request_with_model<R: RequestLike>(
         &self,
-        mut request: R,
+        request: R,
         model_id: Option<&str>,
     ) -> crate::error::Result<Stream<'_>> {
+        let (request, rx) = self.build_streaming_chat_request(request, model_id)?;
+        self.runner
+            .get_sender(model_id)?
+            .send(Request::Normal(request))
+            .await?;
+        Ok(Stream { _server: self, rx })
+    }
+
+    /// Prepare an ordered image chat and measure the exact prompt and image tensors before inference.
+    pub async fn prepare_image_chat(
+        &self,
+        request: crate::RequestBuilder,
+    ) -> crate::error::Result<PreparedImageChat> {
+        let model_id = self
+            .runner
+            .get_default_model_id()
+            .map_err(SdkError::RequestValidation)?
+            .ok_or_else(|| SdkError::RequestValidation("no default model loaded".to_string()))?;
+        let (request, rx) = self.build_streaming_chat_request(request, Some(&model_id))?;
+        let prepared = self
+            .runner
+            .prepare_image_chat(request)
+            .await
+            .map_err(|error| SdkError::Inference(error.into()))?;
+        Ok(PreparedImageChat { prepared, rx })
+    }
+
+    /// Stream a previously prepared image chat on the same loaded pipeline.
+    pub async fn stream_prepared_image_chat(
+        &self,
+        request: PreparedImageChat,
+    ) -> crate::error::Result<Stream<'_>> {
+        self.runner
+            .stream_prepared_image_chat(request.prepared)
+            .await
+            .map_err(|error| SdkError::Inference(error.into()))?;
+        Ok(Stream {
+            _server: self,
+            rx: request.rx,
+        })
+    }
+
+    fn build_streaming_chat_request<R: RequestLike>(
+        &self,
+        mut request: R,
+        model_id: Option<&str>,
+    ) -> crate::error::Result<(Box<NormalRequest>, Receiver<Response>)> {
         let (tx, rx) = channel(1);
 
         if let Ok(config) = self.config_with_model(model_id) {
@@ -289,7 +352,7 @@ impl Model {
         };
         let messages = request.take_messages();
         validate_reasoning_controls(&messages)?;
-        let request = Request::Normal(Box::new(NormalRequest {
+        let request = Box::new(NormalRequest {
             messages,
             sampling_params: request.take_sampling_params(),
             seed: None,
@@ -321,13 +384,8 @@ impl Model {
             session_id: request.session_id().map(|s| s.to_string()),
             files: request.take_files(),
             input_files: request.take_input_files(),
-        }));
-
-        self.runner.get_sender(model_id)?.send(request).await?;
-
-        let stream = Stream { _server: self, rx };
-
-        Ok(stream)
+        });
+        Ok((request, rx))
     }
 
     /// Generate with the model (non-streaming).
