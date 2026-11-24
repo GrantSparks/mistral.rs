@@ -643,7 +643,7 @@ checksum = "ade8366b8bd5ba243f0a58f036cc0ca8a2f069cff1a2351ef1cac6b083e16fc0"
 [[package]]
 name = "candle-core"
 version = "0.11.0"
-source = "git+https://github.com/huggingface/candle.git?rev=66a8cf184a5a519671454066b1b9efd446ec9f5c#66a8cf184a5a519671454066b1b9efd446ec9f5c"
+source = "git+https://github.com/huggingface/candle.git?rev=9515d410e3af803fd45efebfef8137f47d85a63d#9515d410e3af803fd45efebfef8137f47d85a63d"
 dependencies = [
  "accelerate-src",
  "byteorder",
@@ -670,13 +670,13 @@ dependencies = [
  "tokenizers 0.23.2",
  "yoke",
  "zerocopy",
- "zip 8.6.0",
+ "zip 9.4.1",
 ]
 
 [[package]]
 name = "candle-flash-attn-v3"
 version = "0.11.0"
-source = "git+https://github.com/huggingface/candle.git?rev=66a8cf184a5a519671454066b1b9efd446ec9f5c#66a8cf184a5a519671454066b1b9efd446ec9f5c"
+source = "git+https://github.com/huggingface/candle.git?rev=9515d410e3af803fd45efebfef8137f47d85a63d#9515d410e3af803fd45efebfef8137f47d85a63d"
 dependencies = [
  "anyhow",
  "candle-core",
@@ -689,7 +689,7 @@ dependencies = [
 [[package]]
 name = "candle-kernels"
 version = "0.11.0"
-source = "git+https://github.com/huggingface/candle.git?rev=66a8cf184a5a519671454066b1b9efd446ec9f5c#66a8cf184a5a519671454066b1b9efd446ec9f5c"
+source = "git+https://github.com/huggingface/candle.git?rev=9515d410e3af803fd45efebfef8137f47d85a63d#9515d410e3af803fd45efebfef8137f47d85a63d"
 dependencies = [
  "cudaforge",
 ]
@@ -697,7 +697,7 @@ dependencies = [
 [[package]]
 name = "candle-metal-kernels"
 version = "0.11.0"
-source = "git+https://github.com/huggingface/candle.git?rev=66a8cf184a5a519671454066b1b9efd446ec9f5c#66a8cf184a5a519671454066b1b9efd446ec9f5c"
+source = "git+https://github.com/huggingface/candle.git?rev=9515d410e3af803fd45efebfef8137f47d85a63d#9515d410e3af803fd45efebfef8137f47d85a63d"
 dependencies = [
  "block2",
  "half",
@@ -712,7 +712,7 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.11.0"
-source = "git+https://github.com/huggingface/candle.git?rev=66a8cf184a5a519671454066b1b9efd446ec9f5c#66a8cf184a5a519671454066b1b9efd446ec9f5c"
+source = "git+https://github.com/huggingface/candle.git?rev=9515d410e3af803fd45efebfef8137f47d85a63d#9515d410e3af803fd45efebfef8137f47d85a63d"
 dependencies = [
  "accelerate-src",
  "candle-core",
@@ -2372,8 +2372,21 @@ dependencies = [
  "cfg-if",
  "js-sys",
  "libc",
- "r-efi",
+ "r-efi 5.3.0",
  "wasip2",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "getrandom"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "300e883d756b2e4ec94e02791f39b04b522276138852cfc41d9fb7e904106099"
+dependencies = [
+ "cfg-if",
+ "js-sys",
+ "libc",
+ "r-efi 6.0.0",
  "wasm-bindgen",
 ]
 
@@ -4917,6 +4930,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
 
 [[package]]
+name = "r-efi"
+version = "6.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
+
+[[package]]
 name = "radix_trie"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7102,9 +7121,9 @@ dependencies = [
 
 [[package]]
 name = "typed-path"
-version = "0.12.1"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e43ffa54726cdc9ea78392023ffe9fe9cf9ac779e1c6fcb0d23f9862e3879d20"
+checksum = "9ce898823d8cd0f028662d2f349694b1af0a5cc9be83f1d213a00d3147445e1e"
 
 [[package]]
 name = "typenum"
@@ -8210,14 +8229,18 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "8.6.0"
+version = "9.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2d04a6b5381502aa6087c94c669499eb1602eb9c5e8198e534de571f7154809b"
+checksum = "23f17fbc870bfac28c6228aed7d6e6df352e26bf7015c4313727e16a7a01ce5e"
 dependencies = [
  "crc32fast",
+ "getrandom 0.4.3",
  "indexmap 2.13.0",
+ "libc",
  "memchr",
+ "nix 0.31.3",
  "typed-path",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
